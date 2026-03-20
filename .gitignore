@@ -1,0 +1,23 @@
+# Data
+historical_data/
+*.wal
+*.parquet
+*.tmp
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Deployment
+*_backup_*/
+*.zip
+*.pem
+.env
+config_local.py
