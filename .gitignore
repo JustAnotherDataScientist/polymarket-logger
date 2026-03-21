@@ -4,6 +4,11 @@ historical_data/
 *.parquet
 *.tmp
 
+# Analysis outputs
+edge_signals.jsonl
+edge_report.json
+strategy_report.json
+
 # Logs
 logs/
 *.log
@@ -21,3 +26,8 @@ venv/
 *.pem
 .env
 config_local.py
+
+# OS
+.DS_Store
+Thumbs.db
+logger.log.*
