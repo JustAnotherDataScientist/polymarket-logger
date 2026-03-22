@@ -827,7 +827,7 @@ class WindowBacktest:
                 sell_size = min(action.size_usdc, position.size_usdc)
                 fill = snap.simulate_taker_sell(sell_size)
                 if fill.filled_size > 0:
-                    pnl = (fill.avg_price - position.avg_entry_price) * fill.filled_size
+                    pnl = (fill.avg_price / position.avg_entry_price - 1.0) * fill.filled_size if position.avg_entry_price > 0 else 0.0
                     slippage = (mid - fill.avg_price) / mid * 10000 if mid else 0
                     trades.append(Trade(
                         ts_us=snap.ts_us, token="up", side="sell",
@@ -841,7 +841,7 @@ class WindowBacktest:
         # ── Settlement at expiry ──────────────────────────────────────────
         if position is not None:
             settlement_price = 1.0 if window.outcome == 1 else 0.0
-            pnl = (settlement_price - position.avg_entry_price) * position.size_usdc
+            pnl = (settlement_price / position.avg_entry_price - 1.0) * position.size_usdc if position.avg_entry_price > 0 else 0.0
             trades.append(Trade(
                 ts_us=window.window_end_us, token="up", side="settlement",
                 price=settlement_price, size_usdc=position.size_usdc,
@@ -918,4 +918,3 @@ def strategy_edge_scalp(ctx: StrategyContext) -> Optional[Action]:
 
     # Otherwise hold to settlement
     return None
-

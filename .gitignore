@@ -31,3 +31,6 @@ config_local.py
 .DS_Store
 Thumbs.db
 logger.log.*
+
+# Generated viewers
+*.html
