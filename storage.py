@@ -403,12 +403,20 @@ class StorageManager:
     def __init__(self) -> None:
         from config import PARQUET_OUTPUT_DIR
         self._parquet = ParquetStorage(PARQUET_OUTPUT_DIR)
+        self._cached_stats: dict = {}
+        self._stats_mono = 0.0
 
     def append(self, row: list[Any]) -> None:
         self._parquet.append(row)
 
     def stats(self) -> dict:
-        return self._parquet.stats()
+        import time
+        now = time.monotonic()
+        if now - self._stats_mono < 30:
+            return self._cached_stats
+        self._cached_stats = self._parquet.stats()
+        self._stats_mono = now
+        return self._cached_stats
 
     def flush(self) -> None:
         self._parquet.flush()

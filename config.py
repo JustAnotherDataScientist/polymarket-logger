@@ -27,8 +27,8 @@ POLYMARKET_WSS_URL    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 BINANCE_MULTI_WSS_URL = (
     "wss://stream.binance.com:9443/stream"
     "?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade"
-    "/btcusdt@depth20@100ms/ethusdt@depth20@100ms"
-    "/solusdt@depth20@100ms/xrpusdt@depth20@100ms"
+    "/btcusdt@depth20@1000ms/ethusdt@depth20@1000ms"
+    "/solusdt@depth20@1000ms/xrpusdt@depth20@1000ms"
 )
 REQUEST_TIMEOUT = 10
 
