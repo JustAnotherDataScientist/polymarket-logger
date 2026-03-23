@@ -71,41 +71,33 @@ def attach_poly_recorder(poly_ws: "PolymarketBookWS", store: "EventStore") -> No
     """
     Monkey-patches PolymarketBookWS._on_message to also record raw events.
     
-    The original _on_message still runs (for live aggregation / dashboard).
-    We intercept the raw JSON, extract what we need, and append to EventStore
-    BEFORE the original handler processes it.
-    
-    This means:
-      - Zero changes to ws_clients.py
-      - Both live state AND raw recording work simultaneously  
-      - If recording fails, live aggregation is unaffected
+    JSON is parsed ONCE — the parsed dict is passed to both the recorder
+    and the original handler via _process_parsed().
     """
-    original_on_message = poly_ws._on_message
-
     def _recording_on_message(ws, message: str) -> None:
-        # Record raw event FIRST (fast — just appends to in-memory buffer)
         recv_us = _ts_us_now()
         try:
-            _record_poly_event(message, recv_us, store, poly_ws)
+            data = json.loads(message)
+        except Exception:
+            return
+
+        # Record raw event (fast — just appends to in-memory buffer)
+        try:
+            _record_poly_event_parsed(data, recv_us, store, poly_ws)
         except Exception as e:
             logger.debug("Poly event recording error: %s", e)
 
-        # Then run original handler (aggregation, dashboard, etc.)
-        original_on_message(ws, message)
+        # Run original handler with pre-parsed data (no second json.loads)
+        poly_ws._process_parsed(data)
 
     poly_ws._on_message = _recording_on_message
     logger.info("Polymarket event recording attached")
 
 
-def _record_poly_event(
-    message: str, recv_us: int,
+def _record_poly_event_parsed(
+    data: Any, recv_us: int,
     store: "EventStore", poly_ws: "PolymarketBookWS",
 ) -> None:
-    try:
-        data = json.loads(message)
-    except Exception:
-        return
-
     events = data if isinstance(data, list) else [data]
     for event in events:
         if not isinstance(event, dict):
@@ -233,32 +225,30 @@ def attach_binance_recorder(
 ) -> None:
     """
     Same monkey-patch approach for the Binance WS.
-    Records every trade and every depth snapshot.
+    JSON parsed once — shared between recorder and original handler.
     """
-    original_on_message = multi_ws._on_message
-
     def _recording_on_message(ws, message: str) -> None:
         recv_us = _ts_us_now()
         try:
-            _record_binance_event(message, recv_us, store, multi_ws)
+            payload = json.loads(message)
+        except Exception:
+            return
+
+        try:
+            _record_binance_event_parsed(payload, recv_us, store, multi_ws)
         except Exception as e:
             logger.debug("Binance event recording error: %s", e)
 
-        original_on_message(ws, message)
+        multi_ws._process_parsed(payload)
 
     multi_ws._on_message = _recording_on_message
     logger.info("Binance event recording attached")
 
 
-def _record_binance_event(
-    message: str, recv_us: int,
+def _record_binance_event_parsed(
+    payload: dict, recv_us: int,
     store: "EventStore", multi_ws: "MultiAssetBinanceTradeWS",
 ) -> None:
-    try:
-        payload = json.loads(message)
-    except Exception:
-        return
-
     if not isinstance(payload, dict):
         return
 

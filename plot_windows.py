@@ -84,6 +84,30 @@ def extract_window_series(events_dir, windows):
     books['imbalance'] = (books['bid_depth'] - books['ask_depth']) / (books['bid_depth'] + books['ask_depth']).clip(lower=1)
     print(f"  {len(books):,} book snapshots loaded")
 
+    # Load Binance trades
+    COIN_TO_SYMBOL = {'btc': 'BTCUSDT', 'eth': 'ETHUSDT', 'sol': 'SOLUSDT', 'xrp': 'XRPUSDT'}
+    bn_by_symbol = {}
+    bn_dir = os.path.join(events_dir, 'bn_trades')
+    bn_files = sorted(glob.glob(os.path.join(bn_dir, '*.parquet')))
+    if bn_files:
+        bn_chunks = []
+        for f in bn_files:
+            try:
+                df = pq.read_table(f).to_pandas()
+                if len(df) > 0:
+                    bn_chunks.append(df)
+            except Exception:
+                pass
+        if bn_chunks:
+            bn_all = pd.concat(bn_chunks, ignore_index=True).sort_values('ts_us')
+            for sym, grp in bn_all.groupby('symbol'):
+                grp = grp.sort_values('ts_us')
+                bn_by_symbol[sym] = {
+                    'ts_us': grp['ts_us'].values,
+                    'price': grp['price'].values.astype(np.float64),
+                }
+            print(f"  {len(bn_all):,} Binance trades loaded")
+
     # Index by token
     books_by_token = {}
     for tid, grp in books.groupby('token_id'):
@@ -204,28 +228,52 @@ def extract_window_series(events_dir, windows):
 
         # Strategy signal: flow+imb thr=0.2
         if flow > 0.2 and imbalance > 0:
-            signal = 'BUY UP'
+            fi_signal = 'BUY UP'
         elif flow < -0.2 and imbalance < 0:
-            signal = 'BUY DN'
+            fi_signal = 'BUY DN'
         elif abs(flow) >= 0.2:
-            signal = 'SKIP (imb)'
+            fi_signal = 'SKIP (imb)'
         else:
-            signal = 'SKIP (flow)'
+            fi_signal = 'SKIP (flow)'
+
+        # Compute Binance distance to target at entry time (t0 + 30s)
+        bn_distance = 0
+        bn_price = None
+        coin = w['coin']
+        bn_sym = COIN_TO_SYMBOL.get(coin, '')
+        bn_data = bn_by_symbol.get(bn_sym)
+        if bn_data is not None and w.get('target_price', 0) > 0:
+            t_entry = t0 + 30_000_000
+            bn_ts = bn_data['ts_us']
+            bn_idx = np.searchsorted(bn_ts, t_entry, side='right') - 1
+            if bn_idx >= 0:
+                bn_price = float(bn_data['price'][bn_idx])
+                bn_distance = round((bn_price - w['target_price']) / w['target_price'] * 10000, 1)
+
+        # Mixed strategy: UP(fi+d>=0) or DOWN(d<=-5)
+        if fi_signal == 'BUY UP' and bn_distance >= 0:
+            signal = 'BUY UP'
+        elif bn_distance <= -5:
+            signal = 'BUY DN'
+        else:
+            signal = 'SKIP'
 
         # PnL: entry at first mid after 30s, settle at outcome
         entry_price = None
+        dn_entry_price = None
         pnl = None
         # Find mid price just after 30s observation
         entry_idx = np.searchsorted(bdata['ts_us'], t0 + 30_000_000, side='left')
         if entry_idx < len(bdata['mid']):
             entry_price = round(float(bdata['mid'][entry_idx]), 4)
+            dn_entry_price = round(1.0 - entry_price, 4)  # DOWN ≈ 1 - UP
 
-        if entry_price is not None and signal in ('BUY UP', 'BUY DN'):
-            if signal == 'BUY UP':
-                settle_price = 1.0 if w['outcome'] == 1 else 0.0
-            else:
-                settle_price = 1.0 if w['outcome'] == 0 else 0.0
-            pnl = round((settle_price / entry_price - 1.0) * 50, 2)  # $50 sizing
+        if signal == 'BUY UP' and entry_price is not None:
+            settle_price = 1.0 if w['outcome'] == 1 else 0.0
+            pnl = round((settle_price / entry_price - 1.0) * 50, 2)
+        elif signal == 'BUY DN' and dn_entry_price is not None and dn_entry_price > 0:
+            settle_price = 1.0 if w['outcome'] == 0 else 0.0
+            pnl = round((settle_price / dn_entry_price - 1.0) * 50, 2)
 
         dt_start = datetime.fromtimestamp(t0 / 1e6, tz=timezone.utc)
 
@@ -240,8 +288,10 @@ def extract_window_series(events_dir, windows):
             'flow_30s': flow,
             'imbalance': imbalance,
             'obs_vol': obs_vol,
+            'fi_signal': fi_signal,
             'signal': signal,
-            'entry_price': entry_price,
+            'bn_distance': bn_distance,
+            'entry_price': entry_price if signal == 'BUY UP' else dn_entry_price,
             'pnl': pnl,
             'n_points': len(rel_s),
             'n_trades': len(trade_points),
@@ -536,10 +586,12 @@ function renderCurrent() {
   const imbCls = w.imbalance > 0 ? 'up' : w.imbalance < 0 ? 'down' : 'neutral';
   const outCls = w.outcome === 'UP' ? 'up' : 'down';
   const coinColor = COIN_COLORS[w.coin] || '#fff';
+  const distCls = w.bn_distance > 3 ? 'up' : w.bn_distance < -3 ? 'down' : 'neutral';
   const sigCls = w.signal.startsWith('BUY') ? (w.pnl > 0 ? 'up' : 'down') : 'neutral';
   const pnlStr = w.pnl !== null ? `$${w.pnl > 0 ? '+' : ''}${w.pnl.toFixed(1)}` : '—';
   const pnlCls = w.pnl !== null ? (w.pnl > 0 ? 'up' : 'down') : 'neutral';
   const entryStr = w.entry_price !== null ? w.entry_price.toFixed(4) : '—';
+  const distStr = `${w.bn_distance > 0 ? '+' : ''}${w.bn_distance.toFixed(1)}bps`;
 
   document.getElementById('info-bar').innerHTML = `
     <div class="info-item"><div class="info-label">Coin</div><div class="info-value" style="color:${coinColor}">${w.coin.toUpperCase()}</div></div>
@@ -548,8 +600,9 @@ function renderCurrent() {
     <div class="info-item"><div class="info-label">Outcome</div><div class="info-value ${outCls}">${w.outcome}</div></div>
     <div class="info-item" style="border-left:2px solid var(--border2);padding-left:12px"><div class="info-label">Flow 30s</div><div class="info-value ${flowCls}">${w.flow_30s > 0 ? '+' : ''}${w.flow_30s.toFixed(3)}</div></div>
     <div class="info-item"><div class="info-label">Imbalance</div><div class="info-value ${imbCls}">${w.imbalance > 0 ? '+' : ''}${w.imbalance.toFixed(3)}</div></div>
-    <div class="info-item"><div class="info-label">Vol 30s</div><div class="info-value neutral">$${w.obs_vol}</div></div>
-    <div class="info-item" style="border-left:2px solid var(--border2);padding-left:12px"><div class="info-label">Signal</div><div class="info-value ${sigCls}" style="font-weight:700">${w.signal}</div></div>
+    <div class="info-item"><div class="info-label">BN Dist</div><div class="info-value ${distCls}" style="font-weight:700">${distStr}</div></div>
+    <div class="info-item" style="border-left:2px solid var(--border2);padding-left:12px"><div class="info-label">FI Signal</div><div class="info-value neutral">${w.fi_signal}</div></div>
+    <div class="info-item"><div class="info-label">MIX Signal</div><div class="info-value ${sigCls}" style="font-weight:700">${w.signal}</div></div>
     <div class="info-item"><div class="info-label">Entry</div><div class="info-value neutral">${entryStr}</div></div>
     <div class="info-item"><div class="info-label">PnL ($50)</div><div class="info-value ${pnlCls}" style="font-weight:700">${pnlStr}</div></div>
   `;

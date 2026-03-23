@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -160,8 +161,15 @@ class EventWriter:
         self._stats_rows_written = 0
         self._stats_bytes_written = 0
 
-        # Background flush thread
+        # Background IO worker (single thread replaces ephemeral threads)
         self._stop = threading.Event()
+        self._write_q: "queue.Queue[tuple]" = queue.Queue()
+        self._io_thread = threading.Thread(
+            target=self._io_loop, daemon=True, name=f"io-{name}"
+        )
+        self._io_thread.start()
+
+        # Background flush thread
         self._flush_thread = threading.Thread(
             target=self._flush_loop, daemon=True, name=f"flush-{name}"
         )
@@ -246,9 +254,17 @@ class EventWriter:
         chunk_idx = self._chunk_idx
         self._chunk_idx += 1
 
-        # Release lock for the actual I/O
-        # (we've already snapshotted, so new appends can proceed)
-        def _write():
+        # Queue the IO work to the persistent worker thread
+        self._write_q.put((date_str, chunk_idx, columns, n_rows))
+
+    def _io_loop(self) -> None:
+        """Single persistent thread that handles all Parquet writes."""
+        while not self._stop.is_set():
+            try:
+                item = self._write_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            date_str, chunk_idx, columns, n_rows = item
             chunk_path = self.output_dir / f"{date_str}_{chunk_idx:04d}.parquet"
             tmp = chunk_path.with_suffix(".tmp")
             try:
@@ -275,14 +291,12 @@ class EventWriter:
                 )
             except Exception as e:
                 logger.error("EventWriter[%s] flush failed: %s", self.name, e)
-                # Try to clean up temp file
                 try:
                     tmp.unlink(missing_ok=True)
                 except Exception:
                     pass
-
-        # Run I/O in a short-lived thread to not block appends
-        threading.Thread(target=_write, daemon=True).start()
+            finally:
+                self._write_q.task_done()
 
     def _flush_loop(self) -> None:
         while not self._stop.is_set():
@@ -365,6 +379,8 @@ class EventWriter:
 
     def close(self) -> None:
         self.flush()
+        # Wait for IO worker to drain the queue
+        self._write_q.join()
         self._stop.set()
 
     def stats(self) -> dict:

@@ -263,7 +263,7 @@ def cache_fills(resolved, books, size_usdc=50.0):
 
 
 def compute_all_signals(resolved, books, trades, bn_data=None):
-    """Compute flow + imbalance + Binance features for obs = 15, 30, 45, 60s.
+    """Compute flow + imbalance on UP and DOWN tokens + Binance features.
     
     bn_data: optional dict from bn_by_symbol for this coin's Binance symbol.
     """
@@ -297,62 +297,86 @@ def compute_all_signals(resolved, books, trades, bn_data=None):
         idx = np.clip(idx, 0, len(bdata['mid']) - 1)
         trade_is_buy[tid] = tdata['price'] >= bdata['mid'][idx]
 
+    def _token_flow_imb(token_id, t_start, obs_us):
+        """Compute flow + imbalance for any token."""
+        bdata = books_by_token.get(token_id)
+        if bdata is None or len(bdata['ts_us']) == 0:
+            return 0, 0, 0, 0, 0  # flow, imb, mid, vol, n_trades
+        bk_ts = bdata['ts_us']
+        i_lo = np.searchsorted(bk_ts, t_start, side='left')
+        i_hi = np.searchsorted(bk_ts, t_start + 10_000_000, side='right')
+        if i_lo >= i_hi:
+            return 0, 0, 0, 0, 0
+        mid = float(bdata['mid'][i_lo])
+        imb = float(np.mean(bdata['imbalance'][i_lo:i_hi]))
+
+        tdata = trades_by_token.get(token_id)
+        if tdata is None or len(tdata['ts_us']) == 0:
+            return 0, imb, mid, 0, 0
+        t_ts = tdata['ts_us']
+        j_lo = np.searchsorted(t_ts, t_start, side='left')
+        j_hi = np.searchsorted(t_ts, t_start + obs_us, side='right')
+        n_trades = j_hi - j_lo
+        if n_trades == 0:
+            return 0, imb, mid, 0, 0
+        sizes = tdata['size'][j_lo:j_hi]
+        is_buy = trade_is_buy.get(token_id)
+        if is_buy is None:
+            return 0, imb, mid, 0, n_trades
+        is_buy_slice = is_buy[j_lo:j_hi]
+        buy_vol = float(sizes[is_buy_slice].sum())
+        sell_vol = float(sizes[~is_buy_slice].sum())
+        total = buy_vol + sell_vol
+        flow = (buy_vol - sell_vol) / total if total > 0 else 0
+        return flow, imb, mid, total, n_trades
+
     all_signals = {}
     for obs_secs in [15, 30, 45, 60]:
         sigs = {}
         obs_us = obs_secs * 1_000_000
         for slug, w in resolved.items():
             up_token = w['up_token']
+            dn_token = w['down_token']
             t_start = w['start_us']
-            t_entry = t_start + obs_us  # entry time = end of observation
+            t_entry = t_start + obs_us
+
+            # UP token signals
+            up_flow, up_imb, up_mid, up_vol, up_ntrades = _token_flow_imb(up_token, t_start, obs_us)
+            if up_mid == 0:
+                continue  # no book data at all
 
             bdata = books_by_token.get(up_token)
-            if bdata is None or len(bdata['ts_us']) == 0:
-                continue
-            bk_ts = bdata['ts_us']
-            i_lo = np.searchsorted(bk_ts, t_start, side='left')
-            i_hi = np.searchsorted(bk_ts, t_start + 10_000_000, side='right')
-            if i_lo >= i_hi:
-                continue
-            mid_start = float(bdata['mid'][i_lo])
-            spread_start = float(np.median(bdata['spread_bps'][i_lo:i_hi]))
-            imbalance = float(np.mean(bdata['imbalance'][i_lo:i_hi]))
+            spread_start = 0
+            if bdata is not None:
+                bk_ts = bdata['ts_us']
+                i_lo = np.searchsorted(bk_ts, t_start, side='left')
+                i_hi = np.searchsorted(bk_ts, t_start + 10_000_000, side='right')
+                if i_hi > i_lo:
+                    spread_start = float(np.median(bdata['spread_bps'][i_lo:i_hi]))
 
-            tdata = trades_by_token.get(up_token)
-            if tdata is None or len(tdata['ts_us']) == 0:
-                sig = {'flow': 0, 'imbalance': imbalance, 'mid_start': mid_start,
-                       'spread_start': spread_start, 'total_vol': 0, 'n_trades': 0}
-            else:
-                t_ts = tdata['ts_us']
-                j_lo = np.searchsorted(t_ts, t_start, side='left')
-                j_hi = np.searchsorted(t_ts, t_start + obs_us, side='right')
-                n_trades = j_hi - j_lo
-                if n_trades == 0:
-                    sig = {'flow': 0, 'imbalance': imbalance, 'mid_start': mid_start,
-                           'spread_start': spread_start, 'total_vol': 0, 'n_trades': 0}
-                else:
-                    sizes = tdata['size'][j_lo:j_hi]
-                    is_buy = trade_is_buy[up_token][j_lo:j_hi]
-                    buy_vol = float(sizes[is_buy].sum())
-                    sell_vol = float(sizes[~is_buy].sum())
-                    total = buy_vol + sell_vol
-                    flow = (buy_vol - sell_vol) / total if total > 0 else 0
-                    sig = {'flow': flow, 'imbalance': imbalance, 'mid_start': mid_start,
-                           'spread_start': spread_start, 'total_vol': total, 'n_trades': n_trades}
+            # DOWN token signals
+            dn_flow, dn_imb, dn_mid, dn_vol, dn_ntrades = _token_flow_imb(dn_token, t_start, obs_us)
+
+            sig = {
+                'flow': up_flow, 'imbalance': up_imb,
+                'mid_start': up_mid, 'spread_start': spread_start,
+                'total_vol': up_vol, 'n_trades': up_ntrades,
+                # DOWN token
+                'dn_flow': dn_flow, 'dn_imbalance': dn_imb,
+                'dn_mid': dn_mid, 'dn_vol': dn_vol, 'dn_n_trades': dn_ntrades,
+            }
 
             # Binance features at entry time
             if bn_data is not None:
                 bn_feat = _bn_features_at(bn_data, t_entry)
                 sig.update(bn_feat)
 
-                # Distance to target (if available)
                 target = w.get('target_price', 0)
                 if target and bn_feat.get('bn_price'):
                     sig['bn_distance_bps'] = (bn_feat['bn_price'] - target) / target * 10000
                 else:
                     sig['bn_distance_bps'] = 0
             else:
-                # Fill with zeros so evaluate doesn't crash
                 for k in ['bn_price', 'bn_ret_30s', 'bn_ret_60s', 'bn_ret_2m', 'bn_ret_5m',
                            'bn_vol_1m', 'bn_vol_5m', 'bn_flow_30s', 'bn_flow_60s',
                            'bn_distance_bps']:
@@ -370,14 +394,19 @@ def compute_all_signals(resolved, books, trades, bn_data=None):
 def evaluate(resolved, fills, signals, obs_secs=30, flow_threshold=0.0,
              use_imbalance=False, interval_filter=None, min_volume=0,
              min_n_trades=0, mid_range=None, size_usdc=50.0,
+             # Direction override
+             force_direction=None,       # "up", "down", or None (use flow/imb)
              # Binance filters
-             bn_momentum_range=None,    # (lo, hi) for bn_ret_30s
-             bn_vol_max=None,           # max bn_vol_1m
-             bn_vol_min=None,           # min bn_vol_1m
-             bn_flow_align=False,       # require bn_flow same sign as poly flow
-             bn_distance_max=None,      # max abs(bn_distance_bps) — skip if too far from target
-             bn_distance_min=None,      # min bn_distance_bps (signed) — positive = above target
-             bn_distance_max_signed=None, # max bn_distance_bps (signed) — for "below target"
+             bn_momentum_range=None,     # (lo, hi) for bn_ret_30s
+             bn_vol_max=None,            # max bn_vol_1m
+             bn_vol_min=None,            # min bn_vol_1m
+             bn_flow_align=False,        # require bn_flow same sign as direction
+             bn_distance_max=None,       # max abs(bn_distance_bps)
+             bn_distance_min=None,       # min bn_distance_bps (signed)
+             bn_distance_max_signed=None,# max bn_distance_bps (signed)
+             # DOWN token filters
+             dn_flow_min=None,           # min DOWN token flow (positive = people buying DOWN)
+             dn_imb_max=None,            # max DOWN token imbalance (negative = ask pressure)
              ):
     sigs = signals.get(obs_secs, {})
     results = []
@@ -390,8 +419,12 @@ def evaluate(resolved, fills, signals, obs_secs=30, flow_threshold=0.0,
         f = fills[slug]
         flow = sig['flow']
         imb = sig['imbalance']
-        if abs(flow) < flow_threshold:
-            continue
+
+        # Flow threshold (skip if no signal) — bypassed when force_direction
+        if force_direction is None:
+            if abs(flow) < flow_threshold:
+                continue
+
         if sig['total_vol'] < min_volume:
             continue
         if sig['n_trades'] < min_n_trades:
@@ -415,7 +448,16 @@ def evaluate(resolved, fills, signals, obs_secs=30, flow_threshold=0.0,
         if bn_distance_max_signed is not None and sig.get('bn_distance_bps', 0) > bn_distance_max_signed:
             continue
 
-        if use_imbalance:
+        # DOWN token filters
+        if dn_flow_min is not None and sig.get('dn_flow', 0) < dn_flow_min:
+            continue
+        if dn_imb_max is not None and sig.get('dn_imbalance', 0) > dn_imb_max:
+            continue
+
+        # Determine direction
+        if force_direction is not None:
+            direction = force_direction
+        elif use_imbalance:
             if flow > 0 and imb > 0:
                 direction = "up"
             elif flow < 0 and imb < 0:
@@ -425,7 +467,7 @@ def evaluate(resolved, fills, signals, obs_secs=30, flow_threshold=0.0,
         else:
             direction = "up" if flow > 0 else "down"
 
-        # Binance flow alignment: require Binance flow agrees with trade direction
+        # Binance flow alignment
         if bn_flow_align:
             bn_fl = sig.get('bn_flow_30s', 0)
             if direction == "up" and bn_fl <= 0:
@@ -449,11 +491,12 @@ def evaluate(resolved, fills, signals, obs_secs=30, flow_threshold=0.0,
             'entry': entry, 'settle': settle, 'pnl': pnl,
             'mid_start': sig['mid_start'], 'spread': sig['spread_start'],
             'total_vol': sig['total_vol'], 'start_us': w['start_us'],
-            # Binance features (for analysis)
             'bn_ret_30s': sig.get('bn_ret_30s', 0),
             'bn_vol_1m': sig.get('bn_vol_1m', 0),
             'bn_flow_30s': sig.get('bn_flow_30s', 0),
             'bn_distance_bps': sig.get('bn_distance_bps', 0),
+            'dn_flow': sig.get('dn_flow', 0),
+            'dn_imbalance': sig.get('dn_imbalance', 0),
         })
     return results
 
@@ -672,36 +715,220 @@ def main(events_dir, coins_filter=None):
     r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_flow_align=True)
     print(row("BN flow aligned", stats(r), 30))
 
-    # ── 7. Daily breakdown ────────────────────────────────────────────
+    # ── 7. DOWN token strategies ──────────────────────────────────────
+    b15 = dict(obs_secs=30, interval_filter=15)
+
+    section("DOWN TOKEN STRATEGIES — 15m (BTC+ETH+SOL)")
+
+    print("  Benchmarks:")
+    r = evaluate(m_resolved, m_fills, m_signals, **b15, force_direction="up")
+    print(row("always buy UP", stats(r), 36))
+    r = evaluate(m_resolved, m_fills, m_signals, **b15, force_direction="down")
+    print(row("always buy DOWN", stats(r), 36))
+
+    print("\n  BN distance → force DOWN:")
+    for d in [0, -3, -5, -7, -10]:
+        r = evaluate(m_resolved, m_fills, m_signals, **b15,
+                     force_direction="down", bn_distance_max_signed=d)
+        print(row(f"DOWN when dist<={d}bps", stats(r), 36))
+
+    print("\n  BN momentum → force DOWN:")
+    for lo, hi in [(-9999, 0), (-9999, -3), (-9999, -5), (-9999, -10)]:
+        r = evaluate(m_resolved, m_fills, m_signals, **b15,
+                     force_direction="down", bn_momentum_range=(lo, hi))
+        print(row(f"DOWN when ret∈[{lo},{hi}]", stats(r), 36))
+
+    print("\n  BN distance + momentum → force DOWN:")
+    for d, ret_hi in [(-3, 0), (-5, 0), (-3, -3), (-5, -5)]:
+        r = evaluate(m_resolved, m_fills, m_signals, **b15,
+                     force_direction="down",
+                     bn_distance_max_signed=d, bn_momentum_range=(-9999, ret_hi))
+        print(row(f"DOWN d<={d} & ret<{ret_hi}", stats(r), 36))
+
+    print("\n  DOWN token flow (people buying DOWN on Poly):")
+    for dn_fl in [0, 0.1, 0.2, 0.3]:
+        r = evaluate(m_resolved, m_fills, m_signals, **b15,
+                     force_direction="down", dn_flow_min=dn_fl)
+        print(row(f"DOWN when dn_flow>={dn_fl}", stats(r), 36))
+
+    print("\n  DOWN token flow + BN distance:")
+    for dn_fl, d in [(0.1, 0), (0.2, 0), (0.1, -3), (0.2, -3), (0.1, -5)]:
+        r = evaluate(m_resolved, m_fills, m_signals, **b15,
+                     force_direction="down", dn_flow_min=dn_fl,
+                     bn_distance_max_signed=d)
+        print(row(f"DOWN dn_fl>={dn_fl} & d<={d}", stats(r), 36))
+
+    # Custom: UP flow negative + distance negative
+    print("\n  UP token bearish signals → buy DOWN:")
+    r = evaluate(m_resolved, m_fills, m_signals,
+                 obs_secs=30, flow_threshold=0.2, use_imbalance=True, interval_filter=15)
+    dn_only = [t for t in r if t['direction'] == 'down']
+    print(row(f"flow+imb gives DOWN", stats(dn_only), 36))
+
+    r = evaluate(m_resolved, m_fills, m_signals,
+                 obs_secs=30, flow_threshold=0.2, use_imbalance=True, interval_filter=15,
+                 bn_distance_max_signed=0)
+    dn_only = [t for t in r if t['direction'] == 'down']
+    print(row(f"flow+imb DOWN + dist<=0", stats(dn_only), 36))
+
+    print("\n  Combined UP+DOWN (best of both):")
+    # UP strategy: flow+imb + distance >= 0
+    up_trades = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=0)
+    # DOWN strategy: force DOWN + distance <= -3
+    dn_trades = evaluate(m_resolved, m_fills, m_signals, **b15,
+                         force_direction="down", bn_distance_max_signed=-3)
+    combined = sorted(up_trades + dn_trades, key=lambda t: t['start_us'])
+    print(row("UP(fi+d>=0) + DN(d<=-3)", stats(combined), 36))
+
+    up_trades2 = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=3)
+    dn_trades2 = evaluate(m_resolved, m_fills, m_signals, **b15,
+                          force_direction="down", bn_distance_max_signed=-3,
+                          dn_flow_min=0.1)
+    combined2 = sorted(up_trades2 + dn_trades2, key=lambda t: t['start_us'])
+    print(row("UP(fi+d>=3) + DN(d<=-3,fl)", stats(combined2), 36))
+
+    # ── 8. Daily breakdown ────────────────────────────────────────────
     section("DAILY — 15m flow+imb thr=0.2 (BTC+ETH+SOL)")
 
     r = evaluate(m_resolved, m_fills, m_signals, **fi15)
     daily(r)
 
-    print("\n  With distance > 0 (above target):")
-    r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=0)
-    daily(r)
+    # ── 8. Daily breakdown — ALL key strategies ────────────────────────
+    section("DAILY BREAKDOWN — ALL KEY STRATEGIES (BTC+ETH+SOL)")
 
-    print("\n  With distance > +3bps:")
-    r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=3)
-    daily(r)
+    key_strats = [
+        ("UP: flow+imb (base)",         fi15, {}),
+        ("UP: fi + d>=0",               fi15, dict(bn_distance_min=0)),
+        ("UP: fi + d>=+3bps",           fi15, dict(bn_distance_min=3)),
+        ("UP: fi + d>=+5bps",           fi15, dict(bn_distance_min=5)),
+        ("DOWN: d<=-3bps",              b15,  dict(force_direction="down", bn_distance_max_signed=-3)),
+        ("DOWN: d<=-5bps",              b15,  dict(force_direction="down", bn_distance_max_signed=-5)),
+    ]
 
-    section("DAILY PER COIN — 15m flow+imb thr=0.2")
+    for label, base_kw, extra_kw in key_strats:
+        r = evaluate(m_resolved, m_fills, m_signals, **base_kw, **extra_kw)
+        s = stats(r)
+        print(f"\n  {label}  (N={s['n']} WR={s['wr']}% PnL=${s['pnl']:+.0f})")
+        daily(r)
+
+    # Mixed strategies daily
+    print(f"\n  MIX: UP(fi+d>=0) + DN(d<=-5)")
+    up_t = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=0)
+    dn_t = evaluate(m_resolved, m_fills, m_signals, **b15,
+                    force_direction="down", bn_distance_max_signed=-5)
+    mixed = sorted(up_t + dn_t, key=lambda t: t['start_us'])
+    s = stats(mixed)
+    print(f"  (N={s['n']} WR={s['wr']}% PnL=${s['pnl']:+.0f} Sharpe={s['sharpe']:+.3f})")
+    daily(mixed)
+
+    print(f"\n  MIX: UP(fi+d>=3) + DN(d<=-5)")
+    up_t2 = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=3)
+    dn_t2 = evaluate(m_resolved, m_fills, m_signals, **b15,
+                     force_direction="down", bn_distance_max_signed=-5)
+    mixed2 = sorted(up_t2 + dn_t2, key=lambda t: t['start_us'])
+    s2 = stats(mixed2)
+    print(f"  (N={s2['n']} WR={s2['wr']}% PnL=${s2['pnl']:+.0f} Sharpe={s2['sharpe']:+.3f})")
+    daily(mixed2)
+
+    # ── 9. Per coin for each strategy ─────────────────────────────────
+    section("PER COIN × PER STRATEGY — 15m (BTC+ETH+SOL)")
+
+    coin_strats = [
+        ("fi base",    fi15, {}),
+        ("fi+d>=0",    fi15, dict(bn_distance_min=0)),
+        ("fi+d>=3",    fi15, dict(bn_distance_min=3)),
+        ("DN d<=-5",   b15,  dict(force_direction="down", bn_distance_max_signed=-5)),
+    ]
 
     for coin in target_coins:
         r, f, s = coin_data[coin]
+        print(f"\n  {coin.upper()}:")
+        for label, base_kw, extra_kw in coin_strats:
+            results = evaluate(r, f, s, **base_kw, **extra_kw)
+            print(row(label, stats(results), 20))
+        # Daily for base
         results = evaluate(r, f, s, **fi15)
         if results:
-            print(f"  {coin.upper()}:")
             daily(results)
 
-    # ── 8. XRP (always shown for reference) ───────────────────────────
+    # ── 10. XRP (always shown for reference) ──────────────────────────
     if 'xrp' in coin_data:
         section("XRP (reference — do not trade)")
         r, f, s = coin_data['xrp']
         for label, kw in [("15m flow+imb", fi15), ("15m flow only", dict(**base, interval_filter=15))]:
             results = evaluate(r, f, s, **kw)
             print(row(label, stats(results)))
+
+    # ── 11. BEST STRATEGY SUMMARY ─────────────────────────────────────
+    section("★ BEST STRATEGY — MIX: UP(fi+d>=0) + DN(d<=-5)")
+
+    up_trades = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=0)
+    dn_trades = evaluate(m_resolved, m_fills, m_signals, **b15,
+                         force_direction="down", bn_distance_max_signed=-5)
+    best = sorted(up_trades + dn_trades, key=lambda t: t['start_us'])
+    s_best = stats(best)
+
+    n_up = sum(1 for t in best if t['direction'] == 'up')
+    n_dn = sum(1 for t in best if t['direction'] == 'down')
+    up_wins = sum(1 for t in best if t['direction'] == 'up' and t['pnl'] > 0)
+    dn_wins = sum(1 for t in best if t['direction'] == 'down' and t['pnl'] > 0)
+    up_pnl = sum(t['pnl'] for t in best if t['direction'] == 'up')
+    dn_pnl = sum(t['pnl'] for t in best if t['direction'] == 'down')
+
+    print(f"\n  Total: {s_best['n']} trades | PnL ${s_best['pnl']:+.1f} | "
+          f"WR {s_best['wr']}% | Sharpe {s_best['sharpe']:+.3f} | DD ${s_best['dd']:.1f}")
+    print(f"  UP arm:   {n_up} trades ({up_wins}W/{n_up-up_wins}L) "
+          f"WR={up_wins/n_up*100:.0f}% PnL=${up_pnl:+.1f}" if n_up else "")
+    print(f"  DOWN arm: {n_dn} trades ({dn_wins}W/{n_dn-dn_wins}L) "
+          f"WR={dn_wins/n_dn*100:.0f}% PnL=${dn_pnl:+.1f}" if n_dn else "")
+
+    print(f"\n  Rules:")
+    print(f"    BUY UP:   15m window + flow>0.2 + imbalance>0 + BN price >= target")
+    print(f"    BUY DOWN: 15m window + BN price <= target - 5bps")
+    print(f"    SKIP:     everything else")
+    print(f"    Entry:    taker buy at t+30s | Size: $50 | Hold to settlement")
+
+    # Daily
+    print(f"\n  Daily:")
+    by_date = defaultdict(list)
+    for t in best:
+        dt = datetime.fromtimestamp(t['start_us'] / 1e6, tz=timezone.utc)
+        by_date[dt.strftime("%Y-%m-%d")].append(t)
+
+    for date in sorted(by_date):
+        day = by_date[date]
+        pnl_arr = [t['pnl'] for t in day]
+        n = len(pnl_arr)
+        wins = sum(1 for p in pnl_arr if p > 0)
+        d_up = [t for t in day if t['direction'] == 'up']
+        d_dn = [t for t in day if t['direction'] == 'down']
+        up_w = sum(1 for t in d_up if t['pnl'] > 0)
+        dn_w = sum(1 for t in d_dn if t['pnl'] > 0)
+        print(f"    {date}:  {n:>3d} trades  PnL=${sum(pnl_arr):>+8.1f}  WR={wins/n*100:.0f}%"
+              f"  | UP {len(d_up)}t ({up_w}W) ${sum(t['pnl'] for t in d_up):>+7.1f}"
+              f"  | DN {len(d_dn)}t ({dn_w}W) ${sum(t['pnl'] for t in d_dn):>+7.1f}")
+
+    # Per coin
+    print(f"\n  Per coin:")
+    for coin in target_coins:
+        ct = [t for t in best if t['coin'] == coin]
+        if not ct:
+            continue
+        s_c = stats(ct)
+        c_up = [t for t in ct if t['direction'] == 'up']
+        c_dn = [t for t in ct if t['direction'] == 'down']
+        print(f"    {coin.upper():>4s}:  {s_c['n']:>3d}t  PnL=${s_c['pnl']:>+7.1f}  WR={s_c['wr']}%"
+              f"  | UP {len(c_up)}t ${sum(t['pnl'] for t in c_up):>+7.1f}"
+              f"  | DN {len(c_dn)}t ${sum(t['pnl'] for t in c_dn):>+7.1f}")
+
+    # At $5 sizing
+    scale = 5 / 50
+    n_days = len(by_date)
+    print(f"\n  At $5/trade ({n_days} days):")
+    print(f"    PnL: ${s_best['pnl']*scale:+.1f} total | "
+          f"${s_best['pnl']*scale/n_days:+.1f}/day")
+    print(f"    DD:  ${s_best['dd']*scale:.1f}")
+    print(f"    Trades/day: {s_best['n']/n_days:.0f}")
 
     # ── Done ──────────────────────────────────────────────────────────
     print(f"\n{'═'*70}")

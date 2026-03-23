@@ -108,16 +108,22 @@ def main(events_dir, output_path="pnl_viewer.html"):
 
     # Define all strategies
     fi15 = dict(obs_secs=30, flow_threshold=0.2, use_imbalance=True, interval_filter=15)
+    b15 = dict(obs_secs=30, interval_filter=15)
 
     strategy_defs = {
-        'fi15':       ('15m flow+imb (base)',       '#f5c842', None,   fi15),
-        'flow15':     ('15m flow only',             '#5a7099', [6,3],  dict(obs_secs=30, flow_threshold=0.2, interval_filter=15)),
-        'fi15_d0':    ('+ above target (d>=0)',     '#22d98e', None,   dict(**fi15, bn_distance_min=0)),
-        'fi15_d3':    ('+ above +3bps',             '#4d94ff', None,   dict(**fi15, bn_distance_min=3)),
-        'fi15_d5':    ('+ above +5bps',             '#a06cff', None,   dict(**fi15, bn_distance_min=5)),
-        'fi15_below': ('+ below target (d<=0)',     '#ff4070', [4,4],  dict(**fi15, bn_distance_max_signed=0)),
-        'fi_all':     ('flow+imb ALL intervals',    '#3d5a80', [8,4],  dict(obs_secs=30, flow_threshold=0.2, use_imbalance=True)),
-        'flow5':      ('5m flow thr=0.2',           '#ff4070', [3,3],  dict(obs_secs=30, flow_threshold=0.2, interval_filter=5)),
+        # UP strategies
+        'fi15':       ('UP: flow+imb (base)',       '#f5c842', None,   fi15),
+        'flow15':     ('UP: flow only',             '#5a7099', [6,3],  dict(obs_secs=30, flow_threshold=0.2, interval_filter=15)),
+        'fi15_d0':    ('UP: fi + d>=0',             '#22d98e', None,   dict(**fi15, bn_distance_min=0)),
+        'fi15_d3':    ('UP: fi + d>=+3bps',         '#4d94ff', None,   dict(**fi15, bn_distance_min=3)),
+        'fi15_d5':    ('UP: fi + d>=+5bps',         '#a06cff', None,   dict(**fi15, bn_distance_min=5)),
+        # DOWN strategies
+        'dn_d3':      ('DOWN: d<=-3bps',            '#ff6b6b', [4,4],  dict(**b15, force_direction="down", bn_distance_max_signed=-3)),
+        'dn_d5':      ('DOWN: d<=-5bps',            '#ff4070', None,   dict(**b15, force_direction="down", bn_distance_max_signed=-5)),
+        'dn_d7':      ('DOWN: d<=-7bps',            '#cc3360', None,   dict(**b15, force_direction="down", bn_distance_max_signed=-7)),
+        # Losers for reference
+        'fi15_below': ('UP: fi + d<=0 (bad)',       '#664400', [4,4],  dict(**fi15, bn_distance_max_signed=0)),
+        'flow5':      ('5m flow (bad)',             '#663333', [3,3],  dict(obs_secs=30, flow_threshold=0.2, interval_filter=5)),
     }
 
     # Evaluate all
@@ -129,17 +135,34 @@ def main(events_dir, output_path="pnl_viewer.html"):
         r, f, s = coin_data[coin]
         strat_results[f'coin_{coin}'] = evaluate(r, f, s, **fi15)
 
+    # Combined strategies (merge trade lists)
+    def combined(up_key, dn_key, label, color):
+        trades = sorted(strat_results.get(up_key, []) + strat_results.get(dn_key, []),
+                        key=lambda t: t['start_us'])
+        return label, color, None, trades
+
+    combined_defs = {
+        'mix_safe':  combined('fi15_d0', 'dn_d5', 'MIX: UP(fi+d>=0) + DN(d<=-5)', '#00ffaa'),
+        'mix_tight': combined('fi15_d3', 'dn_d5', 'MIX: UP(fi+d>=3) + DN(d<=-5)', '#00ccff'),
+        'mix_aggro': combined('fi15',    'dn_d3', 'MIX: UP(fi) + DN(d<=-3)',       '#ffaa00'),
+    }
+
     # Build JSON
     series, summary = {}, {}
     for key, (label, color, dash, kwargs) in strategy_defs.items():
         series[key] = build_series(strat_results[key], label)
         summary[key] = make_stats(strat_results[key])
+    for key, (label, color, dash, trades) in combined_defs.items():
+        strat_results[key] = trades
+        series[key] = build_series(trades, label)
+        summary[key] = make_stats(trades)
     for coin in coins:
         k = f'coin_{coin}'
         series[k] = build_series(strat_results[k], f'{coin.upper()} flow+imb')
         summary[k] = make_stats(strat_results[k])
 
     colors = {k: v[1] for k, v in strategy_defs.items()}
+    colors.update({k: v[1] for k, v in combined_defs.items()})
     colors.update({'coin_btc': '#f7931a', 'coin_eth': '#6b8ef0', 'coin_sol': '#a855f7'})
     dashes = {k: v[2] for k, v in strategy_defs.items()}
 
@@ -211,8 +234,10 @@ tr:hover td { background: var(--s2); }
 <div class="controls">
   <span class="view-label">View:</span>
   <div class="pill-group" id="view-pills">
-    <div class="pill active" data-val="main">STRATEGIES</div>
-    <div class="pill" data-val="distance">DISTANCE</div>
+    <div class="pill active" data-val="main">MAIN</div>
+    <div class="pill" data-val="mixed">MIXED</div>
+    <div class="pill" data-val="up">UP ONLY</div>
+    <div class="pill" data-val="down">DOWN ONLY</div>
     <div class="pill" data-val="per_coin">PER COIN</div>
     <div class="pill" data-val="all">ALL</div>
   </div>
@@ -229,10 +254,12 @@ tr:hover td { background: var(--s2); }
 <script>
 const RAW = __DATA_PLACEHOLDER__;
 const VIEWS = {
-  main:     ['fi15', 'flow15', 'fi_all', 'flow5'],
-  distance: ['fi15', 'fi15_d0', 'fi15_d3', 'fi15_d5', 'fi15_below'],
+  main:     ['fi15', 'fi15_d0', 'dn_d5', 'mix_safe'],
+  mixed:    ['mix_safe', 'mix_tight', 'mix_aggro', 'fi15'],
+  up:       ['fi15', 'fi15_d0', 'fi15_d3', 'fi15_d5'],
+  down:     ['dn_d3', 'dn_d5', 'dn_d7'],
   per_coin: ['coin_btc', 'coin_eth', 'coin_sol'],
-  all:      ['fi15', 'flow15', 'fi15_d0', 'fi15_d3', 'fi15_d5', 'fi15_below', 'coin_btc', 'coin_eth', 'coin_sol'],
+  all:      ['fi15', 'fi15_d0', 'fi15_d3', 'dn_d5', 'dn_d7', 'mix_safe', 'mix_tight'],
 };
 let currentView = 'main', sizeMultiplier = 1, chart = null;
 

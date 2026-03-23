@@ -13,8 +13,8 @@ TIMESCALE_TABLE     = "market_ticks"
 # ──────────────────────────────────────────────
 # Timing
 # ──────────────────────────────────────────────
-POLL_INTERVAL_SECONDS = 0.25
-LOG_INTERVAL_SECONDS  = 0.25   # 4 Hz — matches poll rate, book is event-driven
+POLL_INTERVAL_SECONDS = 1.0
+LOG_INTERVAL_SECONDS  = 5.0    # 0.2 Hz — event store captures every tick anyway
 
 # ──────────────────────────────────────────────
 # API
@@ -78,7 +78,7 @@ POLY_TRADE_DEQUE_MAXLEN        = 10_000
 # ──────────────────────────────────────────────
 # Market / cache
 # ──────────────────────────────────────────────
-MARKET_REFRESH_SECONDS   = 2.0
+MARKET_REFRESH_SECONDS   = 10.0
 TARGET_CACHE_TTL_SECONDS = 3 * 3600
 
 # ──────────────────────────────────────────────

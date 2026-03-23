@@ -2,13 +2,13 @@
 REM sync.bat — Flush local data + download fresh from VM
 REM Usage: sync.bat [IP]
 REM   sync.bat              (uses default IP)
-REM   sync.bat 3.250.28.192 (override IP)
+REM   sync.bat 34.251.130.108 (override IP)
 
 SET SSH_KEY=C:\Users\Raphael\PythonProjects\.ssh\mykeys.pem
 SET LOCAL=C:\Users\Raphael\PythonProjects\polymarket-logger
 SET REMOTE=/home/ubuntu/polymarket-logger
 
-IF "%1"=="" (SET VM_IP=3.250.28.192) ELSE (SET VM_IP=%1)
+IF "%1"=="" (SET VM_IP=34.251.130.108) ELSE (SET VM_IP=%1)
 
 echo.
 echo ═══════════════════════════════════════════
