@@ -72,7 +72,7 @@ ASSET_PRICE_MAX_STALENESS_MS = 1_500
 # In-memory history
 # ──────────────────────────────────────────────
 ASSET_BUCKET_HISTORY_SECONDS   = 3600
-ASSET_TRADE_ID_HISTORY_SECONDS = 7200
+ASSET_TRADE_ID_HISTORY_SECONDS = 300
 POLY_TRADE_DEQUE_MAXLEN        = 10_000
 
 # ──────────────────────────────────────────────
