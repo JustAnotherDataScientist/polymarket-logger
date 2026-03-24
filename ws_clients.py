@@ -497,8 +497,8 @@ class MultiAssetBinanceTradeWS:
         self.state: dict[str, dict[str, Any]] = {}
         for asset in self.symbols_by_asset:
             self.state[asset] = {
-                "second_buckets":       deque(),
-                "recent_trade_ids":     deque(),
+                "second_buckets":       deque(maxlen=4000),
+                "recent_trade_ids":     deque(maxlen=500_000),
                 "recent_trade_id_set":  set(),
                 "last_trade_dt":        None,
                 "last_trade_price":     None,
@@ -524,6 +524,9 @@ class MultiAssetBinanceTradeWS:
                and state["recent_trade_ids"][0][1] < trade_id_cutoff):
             old_id, _ = state["recent_trade_ids"].popleft()
             state["recent_trade_id_set"].discard(old_id)
+        # Safety cap: rebuild set from deque if it grows too large
+        if len(state["recent_trade_id_set"]) > 500_000:
+            state["recent_trade_id_set"] = set(tid for tid, _ in state["recent_trade_ids"])
 
     def _on_open(self, ws):
         self.connected = True
