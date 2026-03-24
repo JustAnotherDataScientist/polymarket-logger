@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-backtest_allcoins.py — Run flow strategy eval across ALL coins.
+backtest_allcoins.py — v4: clean dashboard, real fees, expanded strategies.
 
-Loads all data once, then evaluates per coin + cross-coin.
-Focused on the variants that matter (trimmed from v2 bloat).
+All PnL includes Polymarket crypto taker fees: 0.072 × p × (1−p).
+Maker dropped (adverse selection proven non-viable).
 
 Usage:
   python backtest_allcoins.py historical_data/events
   python backtest_allcoins.py historical_data/events --coin btc eth
 """
 
-import sys, os, glob, argparse, time
+import sys, os, glob, argparse, time, math
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -24,19 +24,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 COIN_TO_SYMBOL = {'btc': 'BTCUSDT', 'eth': 'ETHUSDT', 'sol': 'SOLUSDT', 'xrp': 'XRPUSDT'}
 
+def taker_fee_rate(price):
+    p = max(0.01, min(0.99, price))
+    return 0.072 * (p * (1 - p))
 
 # ═══════════════════════════════════════════════════════════════════════
-# Data loading — all coins at once
+# Data loading
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_all_markets(events_dir):
-    """Load all resolved windows, grouped by coin."""
     mdir = os.path.join(events_dir, 'poly_markets')
     files = sorted(glob.glob(os.path.join(mdir, '*.parquet')))
     if not files:
-        return {}, pd.DataFrame()
+        return {}
     mdf = pa.concat_tables([pq.read_table(f) for f in files]).to_pandas()
-
     windows = {}
     for _, row in mdf.iterrows():
         slug = row['slug']
@@ -51,17 +52,11 @@ def load_all_markets(events_dir):
             }
         if int(row.get('outcome', -1)) in (0, 1):
             windows[slug]['outcome'] = int(row['outcome'])
-
-    resolved = {s: w for s, w in windows.items() if w['outcome'] in (0, 1)}
-    return resolved, mdf
-
+    return {s: w for s, w in windows.items() if w['outcome'] in (0, 1)}
 
 def load_books_and_trades(events_dir, token_ids):
-    """Load books and trades filtered to a set of token IDs."""
     t0 = time.time()
     token_set = set(token_ids)
-
-    # Books
     bdir = os.path.join(events_dir, 'poly_books')
     chunks = []
     for f in sorted(glob.glob(os.path.join(bdir, '*.parquet'))):
@@ -79,8 +74,6 @@ def load_books_and_trades(events_dir, token_ids):
         books['bid_depth'] = total_size(books['bid_sizes'])
         books['ask_depth'] = total_size(books['ask_sizes'])
         books['imbalance'] = (books['bid_depth'] - books['ask_depth']) / (books['bid_depth'] + books['ask_depth']).clip(lower=1)
-
-    # Trades
     tdir = os.path.join(events_dir, 'poly_trades')
     tchunks = []
     for f in sorted(glob.glob(os.path.join(tdir, '*.parquet'))):
@@ -89,20 +82,15 @@ def load_books_and_trades(events_dir, token_ids):
         if len(df) > 0:
             tchunks.append(df)
     trades = pd.concat(tchunks, ignore_index=True).sort_values('ts_us') if tchunks else pd.DataFrame()
-
     print(f"    Books: {len(books):,} | Trades: {len(trades):,} | {time.time()-t0:.1f}s")
     return books, trades
 
-
 def load_bn_trades(events_dir):
-    """Load Binance trades, return indexed by symbol."""
     t0 = time.time()
     bdir = os.path.join(events_dir, 'bn_trades')
     files = sorted(glob.glob(os.path.join(bdir, '*.parquet')))
     if not files:
-        print(f"    No bn_trades data found")
         return {}
-
     chunks = []
     for f in files:
         try:
@@ -111,834 +99,499 @@ def load_bn_trades(events_dir):
                 chunks.append(df)
         except Exception:
             pass
-
     if not chunks:
         return {}
-
     bn = pd.concat(chunks, ignore_index=True).sort_values('ts_us')
     print(f"    Binance trades: {len(bn):,} rows | {time.time()-t0:.1f}s")
-
-    # Index by symbol: sorted arrays
-    bn_by_symbol = {}
+    result = {}
     for sym, grp in bn.groupby('symbol'):
         grp = grp.sort_values('ts_us')
-        bn_by_symbol[sym] = {
+        result[sym] = {
             'ts_us': grp['ts_us'].values,
             'price': grp['price'].values.astype(np.float64),
             'qty': grp['qty'].values.astype(np.float64),
             'is_buy': grp['is_buy'].values,
         }
-    return bn_by_symbol
+    return result
 
+# ═══════════════════════════════════════════════════════════════════════
+# Binance features
+# ═══════════════════════════════════════════════════════════════════════
 
 def _bn_features_at(bn_data, t_us):
-    """
-    Compute Binance features at a given timestamp.
-    Returns dict with momentum, volatility, flow features.
-    """
     if bn_data is None:
         return {}
-
-    ts = bn_data['ts_us']
-    px = bn_data['price']
-    qty = bn_data['qty']
-    is_buy = bn_data['is_buy']
-
-    # Current price: last trade at or before t_us
+    ts, px, qty, is_buy = bn_data['ts_us'], bn_data['price'], bn_data['qty'], bn_data['is_buy']
     idx_now = np.searchsorted(ts, t_us, side='right') - 1
     if idx_now < 0:
         return {}
     price_now = float(px[idx_now])
-
     features = {'bn_price': price_now}
-
-    # Momentum: return over last N seconds
-    for label, lookback_us in [('30s', 30_000_000), ('60s', 60_000_000),
-                                ('2m', 120_000_000), ('5m', 300_000_000)]:
-        t_past = t_us - lookback_us
-        idx_past = np.searchsorted(ts, t_past, side='right') - 1
-        if idx_past >= 0:
-            price_past = float(px[idx_past])
-            if price_past > 0:
-                features[f'bn_ret_{label}'] = (price_now / price_past - 1) * 10000  # bps
-            else:
-                features[f'bn_ret_{label}'] = 0
+    for label, lb in [('10s',10_000_000),('30s',30_000_000),('60s',60_000_000),('2m',120_000_000),('5m',300_000_000)]:
+        idx_p = np.searchsorted(ts, t_us - lb, side='right') - 1
+        if idx_p >= 0:
+            pp = float(px[idx_p])
+            features[f'bn_ret_{label}'] = (price_now / pp - 1) * 10000 if pp > 0 else 0
         else:
             features[f'bn_ret_{label}'] = 0
-
-    # Volatility: std of log returns over last N seconds, using 1s buckets
-    for label, lookback_us in [('1m', 60_000_000), ('5m', 300_000_000)]:
-        t_past = t_us - lookback_us
-        i_lo = np.searchsorted(ts, t_past, side='left')
-        i_hi = np.searchsorted(ts, t_us, side='right')
+    for label, lb in [('1m',60_000_000),('5m',300_000_000)]:
+        i_lo, i_hi = np.searchsorted(ts, t_us - lb, side='left'), np.searchsorted(ts, t_us, side='right')
         if i_hi - i_lo > 10:
-            prices_window = px[i_lo:i_hi]
-            # Sample every ~100 trades for efficiency
-            step = max(1, len(prices_window) // 200)
-            sampled = prices_window[::step].astype(np.float64)
-            if len(sampled) > 2:
-                log_returns = np.diff(np.log(sampled))
-                features[f'bn_vol_{label}'] = float(np.std(log_returns) * 10000)  # bps
-            else:
-                features[f'bn_vol_{label}'] = 0
+            pw = px[i_lo:i_hi]
+            step = max(1, len(pw)//200)
+            sampled = pw[::step].astype(np.float64)
+            features[f'bn_vol_{label}'] = float(np.std(np.diff(np.log(sampled)))*10000) if len(sampled)>2 else 0
         else:
             features[f'bn_vol_{label}'] = 0
-
-    # Flow: buy/sell imbalance over last 30s
-    for label, lookback_us in [('30s', 30_000_000), ('60s', 60_000_000)]:
-        t_past = t_us - lookback_us
-        i_lo = np.searchsorted(ts, t_past, side='left')
-        i_hi = np.searchsorted(ts, t_us, side='right')
+    for label, lb in [('10s',10_000_000),('30s',30_000_000),('60s',60_000_000)]:
+        i_lo, i_hi = np.searchsorted(ts, t_us - lb, side='left'), np.searchsorted(ts, t_us, side='right')
         if i_hi > i_lo:
-            window_qty = qty[i_lo:i_hi]
-            window_buy = is_buy[i_lo:i_hi]
-            buy_vol = float(window_qty[window_buy].sum())
-            sell_vol = float(window_qty[~window_buy].sum())
-            total = buy_vol + sell_vol
-            features[f'bn_flow_{label}'] = (buy_vol - sell_vol) / total if total > 0 else 0
+            wq, wb = qty[i_lo:i_hi], is_buy[i_lo:i_hi]
+            bv, sv = float(wq[wb].sum()), float(wq[~wb].sum())
+            features[f'bn_flow_{label}'] = (bv-sv)/(bv+sv) if (bv+sv)>0 else 0
         else:
             features[f'bn_flow_{label}'] = 0
-
     return features
 
-
 # ═══════════════════════════════════════════════════════════════════════
-# Fill caching + signal computation (same as backtest_btc_v2)
+# Fills (taker with fees)
 # ═══════════════════════════════════════════════════════════════════════
 
 def _vwap_from_asks(ask_prices, ask_sizes, size_usdc):
     if not isinstance(ask_prices, (list, np.ndarray)) or len(ask_prices) == 0:
         return None
-    remaining = size_usdc
-    weighted_sum = 0.0
-    total_filled = 0.0
+    remaining, wsum, total = size_usdc, 0.0, 0.0
     for p, s in zip(ask_prices, ask_sizes):
-        if remaining <= 0:
-            break
+        if remaining <= 0: break
         s = float(s)
-        if s <= 0:
-            continue
+        if s <= 0: continue
         fill = min(remaining, s)
-        weighted_sum += fill * float(p)
-        total_filled += fill
+        wsum += fill * float(p)
+        total += fill
         remaining -= fill
-    return weighted_sum / total_filled if total_filled > 0 else None
-
+    return wsum / total if total > 0 else None
 
 def cache_fills(resolved, books, size_usdc=50.0):
     token_index = {}
     for tid, grp in books.groupby('token_id'):
         grp = grp.sort_values('ts_us')
-        token_index[tid] = (
-            grp['ts_us'].values,
-            grp['ask_prices'].values,
-            grp['ask_sizes'].values,
-        )
-
+        token_index[tid] = (grp['ts_us'].values, grp['ask_prices'].values, grp['ask_sizes'].values)
     entry_offsets = [0, 15, 30, 45, 60]
     fills = {}
-
     for slug, w in resolved.items():
         row = {'outcome': w['outcome'], 'interval': w['interval']}
         for side, token in [('up', w['up_token']), ('down', w['down_token'])]:
-            idx_data = token_index.get(token)
-            if idx_data is None:
-                continue
-            ts_arr, ask_p_arr, ask_s_arr = idx_data
+            idx = token_index.get(token)
+            if idx is None: continue
+            ts_arr, ask_p, ask_s = idx
             for offset in entry_offsets:
                 entry_us = w['start_us'] + offset * 1_000_000
-                if entry_us >= w['end_us']:
-                    continue
+                if entry_us >= w['end_us']: continue
                 pos = np.searchsorted(ts_arr, entry_us, side='left')
-                deadline_us = min(entry_us + 15_000_000, w['end_us'])
+                deadline = min(entry_us + 15_000_000, w['end_us'])
                 price = None
-                while pos < len(ts_arr) and ts_arr[pos] <= deadline_us:
-                    price = _vwap_from_asks(ask_p_arr[pos], ask_s_arr[pos], size_usdc)
-                    if price is not None:
-                        break
+                while pos < len(ts_arr) and ts_arr[pos] <= deadline:
+                    price = _vwap_from_asks(ask_p[pos], ask_s[pos], size_usdc)
+                    if price is not None: break
                     pos += 1
-                row[f'{side}_fill_{offset}s'] = price
+                if price is not None:
+                    row[f'{side}_fill_{offset}s'] = price * (1 + taker_fee_rate(price))
+                else:
+                    row[f'{side}_fill_{offset}s'] = None
         fills[slug] = row
     return fills
 
+# ═══════════════════════════════════════════════════════════════════════
+# Signals
+# ═══════════════════════════════════════════════════════════════════════
 
 def compute_all_signals(resolved, books, trades, bn_data=None):
-    """Compute flow + imbalance on UP and DOWN tokens + Binance features.
-    
-    bn_data: optional dict from bn_by_symbol for this coin's Binance symbol.
-    """
     books_by_token = {}
     for tid, grp in books.groupby('token_id'):
         grp = grp.sort_values('ts_us')
-        books_by_token[tid] = {
-            'ts_us': grp['ts_us'].values,
-            'mid': grp['mid'].values,
-            'spread_bps': grp['spread_bps'].values,
-            'imbalance': grp['imbalance'].values,
-        }
-
+        books_by_token[tid] = {'ts_us': grp['ts_us'].values, 'mid': grp['mid'].values,
+                                'spread_bps': grp['spread_bps'].values, 'imbalance': grp['imbalance'].values}
     trades_by_token = {}
     if len(trades) > 0:
         for tid, grp in trades.groupby('token_id'):
             grp = grp.sort_values('ts_us')
-            trades_by_token[tid] = {
-                'ts_us': grp['ts_us'].values,
-                'price': grp['price'].values.astype(np.float64),
-                'size': grp['size'].values.astype(np.float64),
-            }
-
+            trades_by_token[tid] = {'ts_us': grp['ts_us'].values, 'price': grp['price'].values.astype(np.float64),
+                                     'size': grp['size'].values.astype(np.float64)}
     trade_is_buy = {}
-    for tid, tdata in trades_by_token.items():
-        bdata = books_by_token.get(tid)
-        if bdata is None or len(bdata['ts_us']) == 0:
-            trade_is_buy[tid] = tdata['price'] > 0
-            continue
-        idx = np.searchsorted(bdata['ts_us'], tdata['ts_us'], side='right') - 1
-        idx = np.clip(idx, 0, len(bdata['mid']) - 1)
-        trade_is_buy[tid] = tdata['price'] >= bdata['mid'][idx]
+    for tid, td in trades_by_token.items():
+        bd = books_by_token.get(tid)
+        if bd is None or len(bd['ts_us'])==0:
+            trade_is_buy[tid] = td['price'] > 0; continue
+        idx = np.clip(np.searchsorted(bd['ts_us'], td['ts_us'], side='right')-1, 0, len(bd['mid'])-1)
+        trade_is_buy[tid] = td['price'] >= bd['mid'][idx]
 
-    def _token_flow_imb(token_id, t_start, obs_us):
-        """Compute flow + imbalance for any token."""
-        bdata = books_by_token.get(token_id)
-        if bdata is None or len(bdata['ts_us']) == 0:
-            return 0, 0, 0, 0, 0  # flow, imb, mid, vol, n_trades
-        bk_ts = bdata['ts_us']
-        i_lo = np.searchsorted(bk_ts, t_start, side='left')
-        i_hi = np.searchsorted(bk_ts, t_start + 10_000_000, side='right')
-        if i_lo >= i_hi:
-            return 0, 0, 0, 0, 0
-        mid = float(bdata['mid'][i_lo])
-        imb = float(np.mean(bdata['imbalance'][i_lo:i_hi]))
-
-        tdata = trades_by_token.get(token_id)
-        if tdata is None or len(tdata['ts_us']) == 0:
-            return 0, imb, mid, 0, 0
-        t_ts = tdata['ts_us']
-        j_lo = np.searchsorted(t_ts, t_start, side='left')
-        j_hi = np.searchsorted(t_ts, t_start + obs_us, side='right')
-        n_trades = j_hi - j_lo
-        if n_trades == 0:
-            return 0, imb, mid, 0, 0
-        sizes = tdata['size'][j_lo:j_hi]
-        is_buy = trade_is_buy.get(token_id)
-        if is_buy is None:
-            return 0, imb, mid, 0, n_trades
-        is_buy_slice = is_buy[j_lo:j_hi]
-        buy_vol = float(sizes[is_buy_slice].sum())
-        sell_vol = float(sizes[~is_buy_slice].sum())
-        total = buy_vol + sell_vol
-        flow = (buy_vol - sell_vol) / total if total > 0 else 0
-        return flow, imb, mid, total, n_trades
+    def _flow_imb(token_id, t_start, obs_us):
+        bd = books_by_token.get(token_id)
+        if bd is None or len(bd['ts_us'])==0: return 0,0,0,0,0
+        bts = bd['ts_us']
+        i_lo, i_hi = np.searchsorted(bts, t_start, side='left'), np.searchsorted(bts, t_start+10_000_000, side='right')
+        if i_lo >= i_hi: return 0,0,0,0,0
+        mid = float(bd['mid'][i_lo])
+        imb = float(np.mean(bd['imbalance'][i_lo:i_hi]))
+        td = trades_by_token.get(token_id)
+        if td is None or len(td['ts_us'])==0: return 0, imb, mid, 0, 0
+        j_lo, j_hi = np.searchsorted(td['ts_us'], t_start, side='left'), np.searchsorted(td['ts_us'], t_start+obs_us, side='right')
+        nt = j_hi - j_lo
+        if nt == 0: return 0, imb, mid, 0, 0
+        sz = td['size'][j_lo:j_hi]
+        ib = trade_is_buy.get(token_id)
+        if ib is None: return 0, imb, mid, 0, nt
+        ibs = ib[j_lo:j_hi]
+        bv, sv = float(sz[ibs].sum()), float(sz[~ibs].sum())
+        total = bv + sv
+        return ((bv-sv)/total if total>0 else 0), imb, mid, total, nt
 
     all_signals = {}
     for obs_secs in [15, 30, 45, 60]:
         sigs = {}
         obs_us = obs_secs * 1_000_000
         for slug, w in resolved.items():
-            up_token = w['up_token']
-            dn_token = w['down_token']
             t_start = w['start_us']
             t_entry = t_start + obs_us
-
-            # UP token signals
-            up_flow, up_imb, up_mid, up_vol, up_ntrades = _token_flow_imb(up_token, t_start, obs_us)
-            if up_mid == 0:
-                continue  # no book data at all
-
-            bdata = books_by_token.get(up_token)
-            spread_start = 0
-            if bdata is not None:
-                bk_ts = bdata['ts_us']
-                i_lo = np.searchsorted(bk_ts, t_start, side='left')
-                i_hi = np.searchsorted(bk_ts, t_start + 10_000_000, side='right')
-                if i_hi > i_lo:
-                    spread_start = float(np.median(bdata['spread_bps'][i_lo:i_hi]))
-
-            # DOWN token signals
-            dn_flow, dn_imb, dn_mid, dn_vol, dn_ntrades = _token_flow_imb(dn_token, t_start, obs_us)
-
-            sig = {
-                'flow': up_flow, 'imbalance': up_imb,
-                'mid_start': up_mid, 'spread_start': spread_start,
-                'total_vol': up_vol, 'n_trades': up_ntrades,
-                # DOWN token
-                'dn_flow': dn_flow, 'dn_imbalance': dn_imb,
-                'dn_mid': dn_mid, 'dn_vol': dn_vol, 'dn_n_trades': dn_ntrades,
-            }
-
-            # Binance features at entry time
+            up_flow, up_imb, up_mid, up_vol, up_nt = _flow_imb(w['up_token'], t_start, obs_us)
+            if up_mid == 0: continue
+            bd = books_by_token.get(w['up_token'])
+            spread = 0
+            if bd is not None:
+                bts = bd['ts_us']
+                il, ih = np.searchsorted(bts, t_start, side='left'), np.searchsorted(bts, t_start+10_000_000, side='right')
+                if ih > il: spread = float(np.median(bd['spread_bps'][il:ih]))
+            dn_flow, dn_imb, dn_mid, dn_vol, dn_nt = _flow_imb(w['down_token'], t_start, obs_us)
+            sig = {'flow': up_flow, 'imbalance': up_imb, 'mid_start': up_mid, 'spread_start': spread,
+                   'total_vol': up_vol, 'n_trades': up_nt,
+                   'dn_flow': dn_flow, 'dn_imbalance': dn_imb, 'dn_mid': dn_mid}
             if bn_data is not None:
-                bn_feat = _bn_features_at(bn_data, t_entry)
-                sig.update(bn_feat)
-
-                target = w.get('target_price', 0)
-                if target and bn_feat.get('bn_price'):
-                    sig['bn_distance_bps'] = (bn_feat['bn_price'] - target) / target * 10000
-                else:
-                    sig['bn_distance_bps'] = 0
+                bf = _bn_features_at(bn_data, t_entry)
+                sig.update(bf)
+                tgt = w.get('target_price', 0)
+                sig['bn_distance_bps'] = (bf['bn_price']-tgt)/tgt*10000 if tgt and bf.get('bn_price') else 0
             else:
-                for k in ['bn_price', 'bn_ret_30s', 'bn_ret_60s', 'bn_ret_2m', 'bn_ret_5m',
-                           'bn_vol_1m', 'bn_vol_5m', 'bn_flow_30s', 'bn_flow_60s',
-                           'bn_distance_bps']:
+                for k in ['bn_price','bn_ret_10s','bn_ret_30s','bn_ret_60s','bn_ret_2m','bn_ret_5m',
+                           'bn_vol_1m','bn_vol_5m','bn_flow_10s','bn_flow_30s','bn_flow_60s','bn_distance_bps']:
                     sig[k] = 0
-
             sigs[slug] = sig
         all_signals[obs_secs] = sigs
     return all_signals
 
-
 # ═══════════════════════════════════════════════════════════════════════
-# Evaluate + report (same as backtest_btc_v2)
+# Evaluate
 # ═══════════════════════════════════════════════════════════════════════
 
 def evaluate(resolved, fills, signals, obs_secs=30, flow_threshold=0.0,
-             use_imbalance=False, interval_filter=None, min_volume=0,
-             min_n_trades=0, mid_range=None, size_usdc=50.0,
-             # Direction override
-             force_direction=None,       # "up", "down", or None (use flow/imb)
-             # Binance filters
-             bn_momentum_range=None,     # (lo, hi) for bn_ret_30s
-             bn_vol_max=None,            # max bn_vol_1m
-             bn_vol_min=None,            # min bn_vol_1m
-             bn_flow_align=False,        # require bn_flow same sign as direction
-             bn_distance_max=None,       # max abs(bn_distance_bps)
-             bn_distance_min=None,       # min bn_distance_bps (signed)
-             bn_distance_max_signed=None,# max bn_distance_bps (signed)
-             # DOWN token filters
-             dn_flow_min=None,           # min DOWN token flow (positive = people buying DOWN)
-             dn_imb_max=None,            # max DOWN token imbalance (negative = ask pressure)
-             ):
+             use_imbalance=False, interval_filter=None, size_usdc=50.0,
+             force_direction=None,
+             bn_distance_min=None, bn_distance_max_signed=None, bn_distance_max=None,
+             bn_momentum_range=None, bn_flow_align=False,
+             bn_vol_min=None, bn_vol_max=None, dn_flow_min=None):
     sigs = signals.get(obs_secs, {})
     results = []
     for slug, w in resolved.items():
-        if slug not in sigs or slug not in fills:
-            continue
-        if interval_filter and w['interval'] != interval_filter:
-            continue
-        sig = sigs[slug]
-        f = fills[slug]
-        flow = sig['flow']
-        imb = sig['imbalance']
-
-        # Flow threshold (skip if no signal) — bypassed when force_direction
-        if force_direction is None:
-            if abs(flow) < flow_threshold:
-                continue
-
-        if sig['total_vol'] < min_volume:
-            continue
-        if sig['n_trades'] < min_n_trades:
-            continue
-        if mid_range and not (mid_range[0] <= sig['mid_start'] <= mid_range[1]):
-            continue
-
-        # Binance filters
+        if slug not in sigs or slug not in fills: continue
+        if interval_filter and w['interval'] != interval_filter: continue
+        sig, f = sigs[slug], fills[slug]
+        flow, imb = sig['flow'], sig['imbalance']
+        if force_direction is None and abs(flow) < flow_threshold: continue
         if bn_momentum_range is not None:
-            ret = sig.get('bn_ret_30s', 0)
-            if not (bn_momentum_range[0] <= ret <= bn_momentum_range[1]):
-                continue
-        if bn_vol_min is not None and sig.get('bn_vol_1m', 0) < bn_vol_min:
-            continue
-        if bn_vol_max is not None and sig.get('bn_vol_1m', 0) > bn_vol_max:
-            continue
-        if bn_distance_max is not None and abs(sig.get('bn_distance_bps', 0)) > bn_distance_max:
-            continue
-        if bn_distance_min is not None and sig.get('bn_distance_bps', 0) < bn_distance_min:
-            continue
-        if bn_distance_max_signed is not None and sig.get('bn_distance_bps', 0) > bn_distance_max_signed:
-            continue
-
-        # DOWN token filters
-        if dn_flow_min is not None and sig.get('dn_flow', 0) < dn_flow_min:
-            continue
-        if dn_imb_max is not None and sig.get('dn_imbalance', 0) > dn_imb_max:
-            continue
-
-        # Determine direction
+            r = sig.get('bn_ret_30s', 0)
+            if not (bn_momentum_range[0] <= r <= bn_momentum_range[1]): continue
+        if bn_vol_min is not None and sig.get('bn_vol_1m',0) < bn_vol_min: continue
+        if bn_vol_max is not None and sig.get('bn_vol_1m',0) > bn_vol_max: continue
+        if bn_distance_max is not None and abs(sig.get('bn_distance_bps',0)) > bn_distance_max: continue
+        if bn_distance_min is not None and sig.get('bn_distance_bps',0) < bn_distance_min: continue
+        if bn_distance_max_signed is not None and sig.get('bn_distance_bps',0) > bn_distance_max_signed: continue
+        if dn_flow_min is not None and sig.get('dn_flow',0) < dn_flow_min: continue
         if force_direction is not None:
             direction = force_direction
         elif use_imbalance:
-            if flow > 0 and imb > 0:
-                direction = "up"
-            elif flow < 0 and imb < 0:
-                direction = "down"
-            else:
-                continue
+            if flow > 0 and imb > 0: direction = "up"
+            elif flow < 0 and imb < 0: direction = "down"
+            else: continue
         else:
             direction = "up" if flow > 0 else "down"
-
-        # Binance flow alignment
         if bn_flow_align:
-            bn_fl = sig.get('bn_flow_30s', 0)
-            if direction == "up" and bn_fl <= 0:
-                continue
-            if direction == "down" and bn_fl >= 0:
-                continue
-
-        fill_key = f'{direction}_fill_{obs_secs}s'
-        entry = f.get(fill_key)
-        if entry is None:
-            continue
-        if direction == "up":
-            settle = 1.0 if w['outcome'] == 1 else 0.0
-        else:
-            settle = 1.0 if w['outcome'] == 0 else 0.0
-        pnl = (settle / entry - 1.0) * size_usdc if entry > 0 else 0.0
-        results.append({
-            'slug': slug, 'coin': w['coin'], 'interval': w['interval'],
-            'outcome': w['outcome'], 'direction': direction,
-            'flow': flow, 'imbalance': imb,
-            'entry': entry, 'settle': settle, 'pnl': pnl,
-            'mid_start': sig['mid_start'], 'spread': sig['spread_start'],
-            'total_vol': sig['total_vol'], 'start_us': w['start_us'],
-            'bn_ret_30s': sig.get('bn_ret_30s', 0),
-            'bn_vol_1m': sig.get('bn_vol_1m', 0),
-            'bn_flow_30s': sig.get('bn_flow_30s', 0),
-            'bn_distance_bps': sig.get('bn_distance_bps', 0),
-            'dn_flow': sig.get('dn_flow', 0),
-            'dn_imbalance': sig.get('dn_imbalance', 0),
-        })
+            bf = sig.get('bn_flow_30s', 0)
+            if direction=="up" and bf<=0: continue
+            if direction=="down" and bf>=0: continue
+        entry = f.get(f'{direction}_fill_{obs_secs}s')
+        if entry is None: continue
+        settle = 1.0 if (direction=="up" and w['outcome']==1) or (direction=="down" and w['outcome']==0) else 0.0
+        pnl = (settle/entry - 1.0) * size_usdc if entry > 0 else 0.0
+        results.append({'slug': slug, 'coin': w['coin'], 'interval': w['interval'],
+                        'outcome': w['outcome'], 'direction': direction,
+                        'flow': flow, 'imbalance': imb, 'entry': entry, 'settle': settle,
+                        'pnl': pnl, 'start_us': w['start_us'],
+                        'bn_distance_bps': sig.get('bn_distance_bps',0),
+                        'bn_ret_30s': sig.get('bn_ret_30s',0),
+                        'bn_vol_1m': sig.get('bn_vol_1m',0),
+                        'bn_flow_30s': sig.get('bn_flow_30s',0)})
     return results
 
-
 # ═══════════════════════════════════════════════════════════════════════
-# Reporting helpers
+# Stats & formatting
 # ═══════════════════════════════════════════════════════════════════════
 
 def stats(results):
-    """Compute summary stats from a list of trade results."""
     if not results:
-        return {'n': 0, 'pnl': 0, 'avg': 0, 'wr': 0, 'sharpe': 0, 'dd': 0, 'up': 0, 'dn': 0}
+        return {'n':0,'pnl':0,'avg':0,'wr':0,'sharpe':0,'dd':0}
     pnl = np.array([r['pnl'] for r in results])
     n = len(pnl)
-    wins = int((pnl > 0).sum())
     cum = np.cumsum(pnl)
     dd = float((cum - np.maximum.accumulate(cum)).min())
-    return {
-        'n': n, 'pnl': round(float(pnl.sum()), 1),
-        'avg': round(float(pnl.mean()), 2),
-        'wr': round(wins / n * 100, 1),
-        'sharpe': round(float(pnl.mean() / pnl.std()), 3) if pnl.std() > 0 else 0,
-        'dd': round(dd, 1),
-        'up': sum(1 for r in results if r['direction'] == 'up'),
-        'dn': sum(1 for r in results if r['direction'] == 'down'),
-    }
+    return {'n': n, 'pnl': round(float(pnl.sum()),1), 'avg': round(float(pnl.mean()),2),
+            'wr': round(int((pnl>0).sum())/n*100,1),
+            'sharpe': round(float(pnl.mean()/pnl.std()),3) if pnl.std()>0 else 0,
+            'dd': round(dd,1)}
 
-
-def row(label, s, width=42):
-    """Format one stats line."""
-    if s['n'] == 0:
-        return f"  {label:>{width}s}:  —"
-    return (f"  {label:>{width}s}:  N={s['n']:>3d}  PnL=${s['pnl']:>+8.1f}  "
-            f"avg=${s['avg']:>+6.2f}  WR={s['wr']:>4.1f}%  "
-            f"Sharpe={s['sharpe']:>+6.3f}  DD=${s['dd']:>+8.1f}")
-
-
-def section(title):
-    print(f"\n  {'─'*64}")
-    print(f"  {title}")
-    print(f"  {'─'*64}")
-
-
-def daily(results):
-    """Print daily breakdown."""
-    if not results:
-        return
+def _daily_map(results):
     by_date = defaultdict(list)
     for t in results:
-        dt = datetime.fromtimestamp(t['start_us'] / 1e6, tz=timezone.utc)
+        dt = datetime.fromtimestamp(t['start_us']/1e6, tz=timezone.utc)
         by_date[dt.strftime("%Y-%m-%d")].append(t)
-    for date in sorted(by_date):
-        day = by_date[date]
-        pnl = [t['pnl'] for t in day]
-        wins = sum(1 for p in pnl if p > 0)
-        wr = wins / len(pnl) * 100 if pnl else 0
-        print(f"    {date}: {len(pnl):>3d} trades  PnL=${sum(pnl):>+8.1f}  "
-              f"avg=${np.mean(pnl):>+6.2f}  WR={wr:.0f}%")
+    return by_date
 
+def print_strat_card(label, results, all_dates, show_coins=None):
+    s = stats(results)
+    if s['n'] == 0:
+        print(f"\n  {label}:  — no trades"); return
+    print(f"\n  ┌─ {label}")
+    print(f"  │  N={s['n']}  PnL=${s['pnl']:+.1f}  avg=${s['avg']:+.2f}  "
+          f"WR={s['wr']:.1f}%  Sharpe={s['sharpe']:+.3f}  DD=${s['dd']:.1f}")
+    by_date = _daily_map(results)
+    print(f"  │")
+    print(f"  │  {'date':>12s}  {'N':>4s}  {'PnL':>9s}  {'avg':>8s}  {'WR':>5s}")
+    print(f"  │  {'─'*44}")
+    for date in sorted(all_dates):
+        day = by_date.get(date, [])
+        if not day:
+            print(f"  │  {date:>12s}  {'—':>4s}"); continue
+        dp = np.array([t['pnl'] for t in day])
+        dw = int((dp>0).sum())
+        print(f"  │  {date:>12s}  {len(dp):>4d}  ${dp.sum():>+8.1f}  ${dp.mean():>+7.2f}  {dw/len(dp)*100:>4.0f}%")
+    if show_coins:
+        print(f"  │")
+        print(f"  │  {'coin':>6s}  {'N':>4s}  {'PnL':>9s}  {'avg':>8s}  {'WR':>5s}  {'Sharpe':>7s}")
+        print(f"  │  {'─'*50}")
+        for coin in show_coins:
+            ct = [r for r in results if r['coin'] == coin]
+            if not ct: continue
+            cs = stats(ct)
+            print(f"  │  {coin.upper():>6s}  {cs['n']:>4d}  ${cs['pnl']:>+8.1f}  ${cs['avg']:>+7.2f}  {cs['wr']:>4.1f}%  {cs['sharpe']:>+6.3f}")
+    print(f"  └{'─'*60}")
+
+# ═══════════════════════════════════════════════════════════════════════
+# Strategy definitions
+# ═══════════════════════════════════════════════════════════════════════
+
+def define_strategies():
+    b15 = dict(interval_filter=15)
+    fi = dict(flow_threshold=0.2, use_imbalance=True)
+    strats = []
+
+    # A. Benchmarks
+    strats.append(("A1  always buy UP",                dict(**b15, force_direction="up")))
+    strats.append(("A2  always buy DOWN",              dict(**b15, force_direction="down")))
+
+    # B. Flow only
+    strats.append(("B1  flow>0.2",                     dict(**b15, flow_threshold=0.2)))
+    strats.append(("B2  flow+imbalance",               dict(**b15, **fi)))
+
+    # C. Distance: BUY UP when above target
+    strats.append(("C1  fi + dist>=0",                 dict(**b15, **fi, bn_distance_min=0)))
+    strats.append(("C2  fi + dist>=+3bps",             dict(**b15, **fi, bn_distance_min=3)))
+    strats.append(("C3  fi + dist>=+5bps",             dict(**b15, **fi, bn_distance_min=5)))
+    strats.append(("C4  fi + dist>=+7bps",             dict(**b15, **fi, bn_distance_min=7)))
+    strats.append(("C5  fi + dist>=+10bps",            dict(**b15, **fi, bn_distance_min=10)))
+
+    # D. Mean reversion: BUY UP when below target but flow bullish
+    strats.append(("D1  fi + dist<=0 (mean-rev)",      dict(**b15, **fi, bn_distance_max_signed=0)))
+    strats.append(("D2  fi + dist<=-3bps",             dict(**b15, **fi, bn_distance_max_signed=-3)))
+    strats.append(("D3  fi + dist<=-5bps",             dict(**b15, **fi, bn_distance_max_signed=-5)))
+
+    # E. Pure distance (no flow filter)
+    strats.append(("E1  UP dist>=+5 (no flow)",        dict(**b15, force_direction="up", bn_distance_min=5)))
+    strats.append(("E2  UP dist>=+10 (no flow)",       dict(**b15, force_direction="up", bn_distance_min=10)))
+    strats.append(("E3  UP dist<=-5 (no flow, m-rev)", dict(**b15, force_direction="up", bn_distance_max_signed=-5)))
+
+    # F. Momentum filter
+    strats.append(("F1  fi+d>=3 + ret30s>0",           dict(**b15, **fi, bn_distance_min=3, bn_momentum_range=(0, 9999))))
+    strats.append(("F2  fi+d>=3 + ret30s<0 (reversal)",dict(**b15, **fi, bn_distance_min=3, bn_momentum_range=(-9999, 0))))
+    strats.append(("F3  fi+d<=0 + ret30s<0 (dip-buy)", dict(**b15, **fi, bn_distance_max_signed=0, bn_momentum_range=(-9999, 0))))
+    strats.append(("F4  fi+d<=0 + ret30s>0 (bounce)",  dict(**b15, **fi, bn_distance_max_signed=0, bn_momentum_range=(0, 9999))))
+
+    # G. BN flow alignment
+    strats.append(("G1  fi+d>=3 + BN flow aligned",    dict(**b15, **fi, bn_distance_min=3, bn_flow_align=True)))
+    strats.append(("G2  fi+d<=0 + BN flow aligned",    dict(**b15, **fi, bn_distance_max_signed=0, bn_flow_align=True)))
+
+    # H. Observation window timing
+    strats.append(("H1  fi+d>=5 obs=15s",              dict(**b15, **fi, bn_distance_min=5, obs_secs=15)))
+    strats.append(("H2  fi+d>=5 obs=30s",              dict(**b15, **fi, bn_distance_min=5, obs_secs=30)))
+    strats.append(("H3  fi+d>=5 obs=45s",              dict(**b15, **fi, bn_distance_min=5, obs_secs=45)))
+    strats.append(("H4  fi+d>=5 obs=60s",              dict(**b15, **fi, bn_distance_min=5, obs_secs=60)))
+
+    # I. Tight distance (50/50 zone)
+    strats.append(("I1  fi + |dist|<=5bps",            dict(**b15, **fi, bn_distance_max=5)))
+    strats.append(("I2  fi + |dist|<=3bps",            dict(**b15, **fi, bn_distance_max=3)))
+
+    # J. Volatility filter
+    strats.append(("J1  fi+d>=3 + low vol (<3)",       dict(**b15, **fi, bn_distance_min=3, bn_vol_max=3)))
+    strats.append(("J2  fi+d>=3 + high vol (>3)",      dict(**b15, **fi, bn_distance_min=3, bn_vol_min=3)))
+    strats.append(("J3  fi+d<=0 + high vol",           dict(**b15, **fi, bn_distance_max_signed=0, bn_vol_min=3)))
+
+    # K. Combined: distance + momentum + vol
+    strats.append(("K1  fi+d>=5 + ret30s>0 + lo-vol",  dict(**b15, **fi, bn_distance_min=5, bn_momentum_range=(0,9999), bn_vol_max=5)))
+    strats.append(("K2  fi+d>=5 + BN flow aligned",    dict(**b15, **fi, bn_distance_min=5, bn_flow_align=True)))
+    strats.append(("K3  fi+d<=0 + ret<0 + hi-vol",     dict(**b15, **fi, bn_distance_max_signed=0, bn_momentum_range=(-9999,0), bn_vol_min=2)))
+
+    return strats
 
 # ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
 def main(events_dir, coins_filter=None):
-    print(f"\n{'═'*70}")
-    print(f"  POLYMARKET FLOW BACKTEST")
-    print(f"{'═'*70}")
+    print(f"\n{'═'*74}")
+    print(f"  POLYMARKET BACKTEST v4")
+    print(f"  All PnL includes taker fee: 0.072 × p × (1−p)")
+    print(f"{'═'*74}")
 
     t_total = time.time()
-
-    # ── 1. Load data ──────────────────────────────────────────────────
     print(f"\n  Loading data...")
-    all_windows, mdf = load_all_markets(events_dir)
-    available_coins = sorted(set(w['coin'] for w in all_windows.values()))
-    coins = coins_filter if coins_filter else available_coins
-
-    all_tokens = set()
-    coin_windows = {}
+    all_windows = load_all_markets(events_dir)
+    coins = coins_filter if coins_filter else sorted(set(w['coin'] for w in all_windows.values()))
+    all_tokens, coin_windows = set(), {}
     for coin in coins:
         cw = {s: w for s, w in all_windows.items() if w['coin'] == coin}
         coin_windows[coin] = cw
         for w in cw.values():
-            all_tokens.add(w['up_token'])
-            all_tokens.add(w['down_token'])
+            all_tokens.add(w['up_token']); all_tokens.add(w['down_token'])
 
     books, trades = load_books_and_trades(events_dir, all_tokens)
     bn_by_symbol = load_bn_trades(events_dir)
 
-    # ── 2. Compute signals per coin ───────────────────────────────────
-    coin_data = {}  # coin → (resolved, fills, signals)
+    print(f"\n  Computing signals + fills...")
+    t_comp = time.time()
+    coin_data = {}
     for coin in coins:
         resolved = coin_windows[coin]
-        if not resolved:
-            continue
-        coin_tokens = set()
-        for w in resolved.values():
-            coin_tokens.add(w['up_token'])
-            coin_tokens.add(w['down_token'])
-        cb = books[books['token_id'].isin(coin_tokens)] if len(books) > 0 else books
-        ct = trades[trades['token_id'].isin(coin_tokens)] if len(trades) > 0 else trades
+        if not resolved: continue
+        ct_set = set()
+        for w in resolved.values(): ct_set.add(w['up_token']); ct_set.add(w['down_token'])
+        cb = books[books['token_id'].isin(ct_set)] if len(books)>0 else books
+        ct = trades[trades['token_id'].isin(ct_set)] if len(trades)>0 else trades
         bn = bn_by_symbol.get(COIN_TO_SYMBOL.get(coin, ''))
-        fills = cache_fills(resolved, cb)
-        signals = compute_all_signals(resolved, cb, ct, bn_data=bn)
-        coin_data[coin] = (resolved, fills, signals)
+        coin_data[coin] = (resolved, cache_fills(resolved, cb), compute_all_signals(resolved, cb, ct, bn_data=bn))
+    print(f"    Done in {time.time()-t_comp:.1f}s")
 
-    # Merge BTC+ETH+SOL
-    target_coins = [c for c in ['btc', 'eth', 'sol'] if c in coin_data]
-    m_resolved, m_fills, m_signals = {}, {}, {obs: {} for obs in [15, 30, 45, 60]}
+    target_coins = [c for c in ['btc','eth','sol'] if c in coin_data]
+    m_res, m_fills, m_sigs = {}, {}, {obs:{} for obs in [15,30,45,60]}
     for coin in target_coins:
         r, f, s = coin_data[coin]
-        m_resolved.update(r)
-        m_fills.update(f)
-        for obs in [15, 30, 45, 60]:
-            if obs in s:
-                m_signals[obs].update(s[obs])
+        m_res.update(r); m_fills.update(f)
+        for obs in [15,30,45,60]:
+            if obs in s: m_sigs[obs].update(s[obs])
 
-    # Count dates
-    dates = set()
-    for w in m_resolved.values():
-        dt = datetime.fromtimestamp(w['start_us'] / 1e6, tz=timezone.utc)
-        dates.add(dt.strftime("%Y-%m-%d"))
+    all_dates = sorted(set(datetime.fromtimestamp(w['start_us']/1e6, tz=timezone.utc).strftime("%Y-%m-%d") for w in m_res.values()))
+    n_15m = sum(1 for w in m_res.values() if w['interval']==15)
 
-    print(f"\n  Coins: {', '.join(c.upper() for c in coins)}")
-    print(f"  Dates: {', '.join(sorted(dates))}")
-    for coin in coins:
-        if coin in coin_data:
-            r, _, _ = coin_data[coin]
-            n5 = sum(1 for w in r.values() if w['interval'] == 5)
-            n15 = sum(1 for w in r.values() if w['interval'] == 15)
-            nup = sum(1 for w in r.values() if w['outcome'] == 1)
-            print(f"  {coin.upper():>4s}: {len(r):>4d} windows (5m={n5}, 15m={n15}) | UP={nup} DOWN={len(r)-nup}")
-
-    # ── 3. Strategy comparison ────────────────────────────────────────
-    base = dict(obs_secs=30, flow_threshold=0.2)
-    fi = dict(**base, use_imbalance=True)
-    fi15 = dict(**fi, interval_filter=15)
-
-    section("STRATEGY COMPARISON (BTC+ETH+SOL)")
-
-    strategies = [
-        ("always buy UP (benchmark)", dict(obs_secs=30, flow_threshold=0.0)),
-        ("flow thr=0.2 (all intervals)", base),
-        ("flow+imb thr=0.2 (all intervals)", fi),
-        ("15m flow thr=0.2", dict(**base, interval_filter=15)),
-        ("15m flow+imb thr=0.2", fi15),
-        ("5m flow thr=0.2", dict(**base, interval_filter=5)),
-    ]
-    for label, kw in strategies:
-        r = evaluate(m_resolved, m_fills, m_signals, **kw)
-        print(row(label, stats(r)))
-
-    # ── 4. Per coin (15m flow+imb) ────────────────────────────────────
-    section("PER COIN — 15m flow+imb thr=0.2")
-
-    for coin in coins:
-        if coin not in coin_data:
-            continue
-        r, f, s = coin_data[coin]
-        results = evaluate(r, f, s, **fi15)
-        print(row(coin.upper(), stats(results)))
-
-    # Combined
-    r = evaluate(m_resolved, m_fills, m_signals, **fi15)
-    print(row("BTC+ETH+SOL", stats(r)))
-
-    # ── 5. Distance to target (the key finding) ──────────────────────
-    section("DISTANCE TO TARGET — 15m flow+imb (BTC+ETH+SOL)")
-
-    print("  Absolute distance:")
-    for d in [9999, 20, 15, 10, 7, 5, 3]:
-        label = "no filter" if d == 9999 else f"|dist| <= {d}bps"
-        r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_max=d)
-        print(row(label, stats(r), 30))
-
-    print("\n  Directional:")
-    r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=0)
-    print(row("price ABOVE target", stats(r), 30))
-    r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_max_signed=0)
-    print(row("price BELOW target", stats(r), 30))
-
-    print("\n  Above target by X bps:")
-    for d in [0, 3, 5, 7, 10]:
-        r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=d)
-        print(row(f"above +{d}bps", stats(r), 30))
-
-    print("\n  Below target by X bps:")
-    for d in [0, -3, -5, -7, -10]:
-        r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_max_signed=d)
-        print(row(f"below {d}bps", stats(r), 30))
-
-    # Per coin distance
-    print("\n  Per coin — above +3bps:")
+    print(f"\n  Coins: {', '.join(c.upper() for c in target_coins)}")
+    print(f"  Dates: {', '.join(all_dates)} ({len(all_dates)} days)")
+    print(f"  15m resolved windows: {n_15m}")
     for coin in target_coins:
-        r, f, s = coin_data[coin]
-        results = evaluate(r, f, s, **fi15, bn_distance_min=3)
-        print(row(f"{coin.upper()} above +3bps", stats(results), 30))
+        r15 = {s:w for s,w in coin_windows.get(coin,{}).items() if w['interval']==15 and w['outcome'] in (0,1)}
+        up = sum(1 for w in r15.values() if w['outcome']==1)
+        print(f"    {coin.upper()}: {len(r15)} | UP={up} DOWN={len(r15)-up}")
 
-    print("\n  Per coin — above +5bps:")
-    for coin in target_coins:
-        r, f, s = coin_data[coin]
-        results = evaluate(r, f, s, **fi15, bn_distance_min=5)
-        print(row(f"{coin.upper()} above +5bps", stats(results), 30))
+    # ═══════════════════════════════════════════════════════════════
+    # Strategy grid
+    # ═══════════════════════════════════════════════════════════════
+    strats = define_strategies()
 
-    # ── 6. Other Binance features ─────────────────────────────────────
-    section("OTHER BINANCE FEATURES — 15m flow+imb (BTC+ETH+SOL)")
+    print(f"\n{'═'*90}")
+    print(f"  STRATEGY GRID — BTC+ETH+SOL, 15m, taker+fees")
+    print(f"{'═'*90}")
+    print(f"\n  {'':>38s}  {'N':>4s}  {'PnL':>9s}  {'avg':>7s}  {'WR':>5s}  {'Sharpe':>7s}  {'DD':>9s}")
+    print(f"  {'─'*85}")
 
-    print("  BN momentum (ret 30s):")
-    for label, lo, hi in [("all", -9999, 9999), ("positive", 0, 9999), ("negative", -9999, 0)]:
-        r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_momentum_range=(lo, hi))
-        print(row(label, stats(r), 30))
-
-    print("\n  BN flow alignment:")
-    r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_flow_align=False)
-    print(row("no filter", stats(r), 30))
-    r = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_flow_align=True)
-    print(row("BN flow aligned", stats(r), 30))
-
-    # ── 7. DOWN token strategies ──────────────────────────────────────
-    b15 = dict(obs_secs=30, interval_filter=15)
-
-    section("DOWN TOKEN STRATEGIES — 15m (BTC+ETH+SOL)")
-
-    print("  Benchmarks:")
-    r = evaluate(m_resolved, m_fills, m_signals, **b15, force_direction="up")
-    print(row("always buy UP", stats(r), 36))
-    r = evaluate(m_resolved, m_fills, m_signals, **b15, force_direction="down")
-    print(row("always buy DOWN", stats(r), 36))
-
-    print("\n  BN distance → force DOWN:")
-    for d in [0, -3, -5, -7, -10]:
-        r = evaluate(m_resolved, m_fills, m_signals, **b15,
-                     force_direction="down", bn_distance_max_signed=d)
-        print(row(f"DOWN when dist<={d}bps", stats(r), 36))
-
-    print("\n  BN momentum → force DOWN:")
-    for lo, hi in [(-9999, 0), (-9999, -3), (-9999, -5), (-9999, -10)]:
-        r = evaluate(m_resolved, m_fills, m_signals, **b15,
-                     force_direction="down", bn_momentum_range=(lo, hi))
-        print(row(f"DOWN when ret∈[{lo},{hi}]", stats(r), 36))
-
-    print("\n  BN distance + momentum → force DOWN:")
-    for d, ret_hi in [(-3, 0), (-5, 0), (-3, -3), (-5, -5)]:
-        r = evaluate(m_resolved, m_fills, m_signals, **b15,
-                     force_direction="down",
-                     bn_distance_max_signed=d, bn_momentum_range=(-9999, ret_hi))
-        print(row(f"DOWN d<={d} & ret<{ret_hi}", stats(r), 36))
-
-    print("\n  DOWN token flow (people buying DOWN on Poly):")
-    for dn_fl in [0, 0.1, 0.2, 0.3]:
-        r = evaluate(m_resolved, m_fills, m_signals, **b15,
-                     force_direction="down", dn_flow_min=dn_fl)
-        print(row(f"DOWN when dn_flow>={dn_fl}", stats(r), 36))
-
-    print("\n  DOWN token flow + BN distance:")
-    for dn_fl, d in [(0.1, 0), (0.2, 0), (0.1, -3), (0.2, -3), (0.1, -5)]:
-        r = evaluate(m_resolved, m_fills, m_signals, **b15,
-                     force_direction="down", dn_flow_min=dn_fl,
-                     bn_distance_max_signed=d)
-        print(row(f"DOWN dn_fl>={dn_fl} & d<={d}", stats(r), 36))
-
-    # Custom: UP flow negative + distance negative
-    print("\n  UP token bearish signals → buy DOWN:")
-    r = evaluate(m_resolved, m_fills, m_signals,
-                 obs_secs=30, flow_threshold=0.2, use_imbalance=True, interval_filter=15)
-    dn_only = [t for t in r if t['direction'] == 'down']
-    print(row(f"flow+imb gives DOWN", stats(dn_only), 36))
-
-    r = evaluate(m_resolved, m_fills, m_signals,
-                 obs_secs=30, flow_threshold=0.2, use_imbalance=True, interval_filter=15,
-                 bn_distance_max_signed=0)
-    dn_only = [t for t in r if t['direction'] == 'down']
-    print(row(f"flow+imb DOWN + dist<=0", stats(dn_only), 36))
-
-    print("\n  Combined UP+DOWN (best of both):")
-    # UP strategy: flow+imb + distance >= 0
-    up_trades = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=0)
-    # DOWN strategy: force DOWN + distance <= -3
-    dn_trades = evaluate(m_resolved, m_fills, m_signals, **b15,
-                         force_direction="down", bn_distance_max_signed=-3)
-    combined = sorted(up_trades + dn_trades, key=lambda t: t['start_us'])
-    print(row("UP(fi+d>=0) + DN(d<=-3)", stats(combined), 36))
-
-    up_trades2 = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=3)
-    dn_trades2 = evaluate(m_resolved, m_fills, m_signals, **b15,
-                          force_direction="down", bn_distance_max_signed=-3,
-                          dn_flow_min=0.1)
-    combined2 = sorted(up_trades2 + dn_trades2, key=lambda t: t['start_us'])
-    print(row("UP(fi+d>=3) + DN(d<=-3,fl)", stats(combined2), 36))
-
-    # ── 8. Daily breakdown ────────────────────────────────────────────
-    section("DAILY — 15m flow+imb thr=0.2 (BTC+ETH+SOL)")
-
-    r = evaluate(m_resolved, m_fills, m_signals, **fi15)
-    daily(r)
-
-    # ── 8. Daily breakdown — ALL key strategies ────────────────────────
-    section("DAILY BREAKDOWN — ALL KEY STRATEGIES (BTC+ETH+SOL)")
-
-    key_strats = [
-        ("UP: flow+imb (base)",         fi15, {}),
-        ("UP: fi + d>=0",               fi15, dict(bn_distance_min=0)),
-        ("UP: fi + d>=+3bps",           fi15, dict(bn_distance_min=3)),
-        ("UP: fi + d>=+5bps",           fi15, dict(bn_distance_min=5)),
-        ("DOWN: d<=-3bps",              b15,  dict(force_direction="down", bn_distance_max_signed=-3)),
-        ("DOWN: d<=-5bps",              b15,  dict(force_direction="down", bn_distance_max_signed=-5)),
-    ]
-
-    for label, base_kw, extra_kw in key_strats:
-        r = evaluate(m_resolved, m_fills, m_signals, **base_kw, **extra_kw)
+    strat_results = {}
+    for label, kw in strats:
+        r = evaluate(m_res, m_fills, m_sigs, **kw)
         s = stats(r)
-        print(f"\n  {label}  (N={s['n']} WR={s['wr']}% PnL=${s['pnl']:+.0f})")
-        daily(r)
+        strat_results[label] = r
+        if s['n'] == 0:
+            print(f"  {label:>38s}  {'—':>4s}")
+        else:
+            print(f"  {label:>38s}  {s['n']:>4d}  ${s['pnl']:>+8.1f}  ${s['avg']:>+6.2f}  {s['wr']:>4.1f}%  {s['sharpe']:>+6.3f}  ${s['dd']:>+8.1f}")
 
-    # Mixed strategies daily
-    print(f"\n  MIX: UP(fi+d>=0) + DN(d<=-5)")
-    up_t = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=0)
-    dn_t = evaluate(m_resolved, m_fills, m_signals, **b15,
-                    force_direction="down", bn_distance_max_signed=-5)
-    mixed = sorted(up_t + dn_t, key=lambda t: t['start_us'])
-    s = stats(mixed)
-    print(f"  (N={s['n']} WR={s['wr']}% PnL=${s['pnl']:+.0f} Sharpe={s['sharpe']:+.3f})")
-    daily(mixed)
+    # Rankings
+    ranked = [(l, stats(r)) for l, r in strat_results.items() if stats(r)['n'] >= 15]
+    by_sharpe = sorted(ranked, key=lambda x: x[1]['sharpe'], reverse=True)
+    by_pnl = sorted(ranked, key=lambda x: x[1]['pnl'], reverse=True)
 
-    print(f"\n  MIX: UP(fi+d>=3) + DN(d<=-5)")
-    up_t2 = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=3)
-    dn_t2 = evaluate(m_resolved, m_fills, m_signals, **b15,
-                     force_direction="down", bn_distance_max_signed=-5)
-    mixed2 = sorted(up_t2 + dn_t2, key=lambda t: t['start_us'])
-    s2 = stats(mixed2)
-    print(f"  (N={s2['n']} WR={s2['wr']}% PnL=${s2['pnl']:+.0f} Sharpe={s2['sharpe']:+.3f})")
-    daily(mixed2)
+    print(f"\n{'═'*74}")
+    print(f"  TOP 5 BY SHARPE (N≥15)")
+    print(f"{'═'*74}")
+    for l, s in by_sharpe[:5]:
+        print(f"    {s['sharpe']:>+6.3f}  {l}  N={s['n']} PnL=${s['pnl']:+.1f} WR={s['wr']}%")
 
-    # ── 9. Per coin for each strategy ─────────────────────────────────
-    section("PER COIN × PER STRATEGY — 15m (BTC+ETH+SOL)")
+    print(f"\n{'═'*74}")
+    print(f"  TOP 5 BY PnL (N≥15)")
+    print(f"{'═'*74}")
+    for l, s in by_pnl[:5]:
+        print(f"    ${s['pnl']:>+8.1f}  {l}  N={s['n']} Sharpe={s['sharpe']:+.3f} WR={s['wr']}%")
 
-    coin_strats = [
-        ("fi base",    fi15, {}),
-        ("fi+d>=0",    fi15, dict(bn_distance_min=0)),
-        ("fi+d>=3",    fi15, dict(bn_distance_min=3)),
-        ("DN d<=-5",   b15,  dict(force_direction="down", bn_distance_max_signed=-5)),
-    ]
+    # ═══════════════════════════════════════════════════════════════
+    # Detailed cards
+    # ═══════════════════════════════════════════════════════════════
+    print(f"\n{'═'*74}")
+    print(f"  DETAILED CARDS — top strategies + benchmarks")
+    print(f"{'═'*74}")
+
+    shown = set()
+    cards = []
+    for l, _ in by_sharpe[:5]:
+        if l not in shown: cards.append(l); shown.add(l)
+    for l, s in ranked:
+        if s['sharpe'] > 0.05 and l not in shown: cards.append(l); shown.add(l)
+    for l in ["A1  always buy UP", "B2  flow+imbalance"]:
+        if l not in shown: cards.append(l); shown.add(l)
+
+    for label in cards:
+        print_strat_card(label, strat_results.get(label,[]), all_dates, show_coins=target_coins)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Per coin
+    # ═══════════════════════════════════════════════════════════════
+    top_labels = [l for l,s in by_sharpe[:5] if s['sharpe']>0]
+    ref_labels = ["A1  always buy UP", "B2  flow+imbalance"]
+
+    print(f"\n{'═'*74}")
+    print(f"  PER COIN — top strategies")
+    print(f"{'═'*74}")
 
     for coin in target_coins:
         r, f, s = coin_data[coin]
         print(f"\n  {coin.upper()}:")
-        for label, base_kw, extra_kw in coin_strats:
-            results = evaluate(r, f, s, **base_kw, **extra_kw)
-            print(row(label, stats(results), 20))
-        # Daily for base
-        results = evaluate(r, f, s, **fi15)
-        if results:
-            daily(results)
+        print(f"  {'':>38s}  {'N':>4s}  {'PnL':>9s}  {'avg':>7s}  {'WR':>5s}  {'Sharpe':>7s}")
+        print(f"  {'─'*72}")
+        for label, kw in strats:
+            if label not in top_labels and label not in ref_labels: continue
+            cr = evaluate(r, f, s, **kw)
+            cs = stats(cr)
+            if cs['n'] == 0: continue
+            print(f"  {label:>38s}  {cs['n']:>4d}  ${cs['pnl']:>+8.1f}  ${cs['avg']:>+6.2f}  {cs['wr']:>4.1f}%  {cs['sharpe']:>+6.3f}")
 
-    # ── 10. XRP (always shown for reference) ──────────────────────────
-    if 'xrp' in coin_data:
-        section("XRP (reference — do not trade)")
-        r, f, s = coin_data['xrp']
-        for label, kw in [("15m flow+imb", fi15), ("15m flow only", dict(**base, interval_filter=15))]:
-            results = evaluate(r, f, s, **kw)
-            print(row(label, stats(results)))
-
-    # ── 11. BEST STRATEGY SUMMARY ─────────────────────────────────────
-    section("★ BEST STRATEGY — MIX: UP(fi+d>=0) + DN(d<=-5)")
-
-    up_trades = evaluate(m_resolved, m_fills, m_signals, **fi15, bn_distance_min=0)
-    dn_trades = evaluate(m_resolved, m_fills, m_signals, **b15,
-                         force_direction="down", bn_distance_max_signed=-5)
-    best = sorted(up_trades + dn_trades, key=lambda t: t['start_us'])
-    s_best = stats(best)
-
-    n_up = sum(1 for t in best if t['direction'] == 'up')
-    n_dn = sum(1 for t in best if t['direction'] == 'down')
-    up_wins = sum(1 for t in best if t['direction'] == 'up' and t['pnl'] > 0)
-    dn_wins = sum(1 for t in best if t['direction'] == 'down' and t['pnl'] > 0)
-    up_pnl = sum(t['pnl'] for t in best if t['direction'] == 'up')
-    dn_pnl = sum(t['pnl'] for t in best if t['direction'] == 'down')
-
-    print(f"\n  Total: {s_best['n']} trades | PnL ${s_best['pnl']:+.1f} | "
-          f"WR {s_best['wr']}% | Sharpe {s_best['sharpe']:+.3f} | DD ${s_best['dd']:.1f}")
-    print(f"  UP arm:   {n_up} trades ({up_wins}W/{n_up-up_wins}L) "
-          f"WR={up_wins/n_up*100:.0f}% PnL=${up_pnl:+.1f}" if n_up else "")
-    print(f"  DOWN arm: {n_dn} trades ({dn_wins}W/{n_dn-dn_wins}L) "
-          f"WR={dn_wins/n_dn*100:.0f}% PnL=${dn_pnl:+.1f}" if n_dn else "")
-
-    print(f"\n  Rules:")
-    print(f"    BUY UP:   15m window + flow>0.2 + imbalance>0 + BN price >= target")
-    print(f"    BUY DOWN: 15m window + BN price <= target - 5bps")
-    print(f"    SKIP:     everything else")
-    print(f"    Entry:    taker buy at t+30s | Size: $50 | Hold to settlement")
-
-    # Daily
-    print(f"\n  Daily:")
-    by_date = defaultdict(list)
-    for t in best:
-        dt = datetime.fromtimestamp(t['start_us'] / 1e6, tz=timezone.utc)
-        by_date[dt.strftime("%Y-%m-%d")].append(t)
-
-    for date in sorted(by_date):
-        day = by_date[date]
-        pnl_arr = [t['pnl'] for t in day]
-        n = len(pnl_arr)
-        wins = sum(1 for p in pnl_arr if p > 0)
-        d_up = [t for t in day if t['direction'] == 'up']
-        d_dn = [t for t in day if t['direction'] == 'down']
-        up_w = sum(1 for t in d_up if t['pnl'] > 0)
-        dn_w = sum(1 for t in d_dn if t['pnl'] > 0)
-        print(f"    {date}:  {n:>3d} trades  PnL=${sum(pnl_arr):>+8.1f}  WR={wins/n*100:.0f}%"
-              f"  | UP {len(d_up)}t ({up_w}W) ${sum(t['pnl'] for t in d_up):>+7.1f}"
-              f"  | DN {len(d_dn)}t ({dn_w}W) ${sum(t['pnl'] for t in d_dn):>+7.1f}")
-
-    # Per coin
-    print(f"\n  Per coin:")
-    for coin in target_coins:
-        ct = [t for t in best if t['coin'] == coin]
-        if not ct:
-            continue
-        s_c = stats(ct)
-        c_up = [t for t in ct if t['direction'] == 'up']
-        c_dn = [t for t in ct if t['direction'] == 'down']
-        print(f"    {coin.upper():>4s}:  {s_c['n']:>3d}t  PnL=${s_c['pnl']:>+7.1f}  WR={s_c['wr']}%"
-              f"  | UP {len(c_up)}t ${sum(t['pnl'] for t in c_up):>+7.1f}"
-              f"  | DN {len(c_dn)}t ${sum(t['pnl'] for t in c_dn):>+7.1f}")
-
-    # At $5 sizing
-    scale = 5 / 50
-    n_days = len(by_date)
-    print(f"\n  At $5/trade ({n_days} days):")
-    print(f"    PnL: ${s_best['pnl']*scale:+.1f} total | "
-          f"${s_best['pnl']*scale/n_days:+.1f}/day")
-    print(f"    DD:  ${s_best['dd']*scale:.1f}")
-    print(f"    Trades/day: {s_best['n']/n_days:.0f}")
-
-    # ── Done ──────────────────────────────────────────────────────────
-    print(f"\n{'═'*70}")
+    print(f"\n{'═'*74}")
     print(f"  DONE in {time.time()-t_total:.0f}s")
-    print(f"{'═'*70}\n")
-
+    print(f"{'═'*74}\n")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('events_dir', nargs='?', default='historical_data/events')
-    parser.add_argument('--coin', nargs='+', help='Filter to specific coins')
+    parser.add_argument('--coin', nargs='+', help='Filter coins')
     args = parser.parse_args()
     main(args.events_dir, args.coin)
