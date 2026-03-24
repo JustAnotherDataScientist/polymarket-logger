@@ -525,6 +525,11 @@ def run_logger(dashboard: Any = None, event_store: Any = None) -> None:
 
     asset_target_cache: dict[str, Optional[float]] = {}
 
+    # ── Paper trader ──────────────────────────────────────────────────────
+    from paper_trader import PaperTrader
+    _paper = PaperTrader()
+    _btc_15m_tracker = next((tr for tr in trackers if tr.key == "btc-15m"), None)
+
     next_tick_mono = time.monotonic()
     next_log_mono  = time.monotonic()
     next_storage_report_mono = time.monotonic() + 3600 * 6
@@ -756,6 +761,13 @@ def run_logger(dashboard: Any = None, event_store: Any = None) -> None:
                             f"{book.get('up_mid'):.4f}" if book.get("up_mid") is not None else "NA",
                             poly["poly_ws_health"],
                         )
+
+                # ── Paper trader tick ─────────────────────────────────────
+                if _btc_15m_tracker is not None:
+                    try:
+                        _paper.tick(market_snaps, _btc_15m_tracker.poly_ws, snap_dt)
+                    except Exception as _pe:
+                        logger.debug("PaperTrader error: %s", _pe)
 
                 # ── Dashboard snapshot ────────────────────────────────────
                 if dashboard is not None:

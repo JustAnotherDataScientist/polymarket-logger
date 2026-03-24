@@ -337,15 +337,33 @@ def evaluate(resolved, fills, signals, obs_secs=30, flow_threshold=0.0,
 
 def stats(results):
     if not results:
-        return {'n':0,'pnl':0,'avg':0,'wr':0,'sharpe':0,'dd':0}
+        return {'n':0,'pnl':0,'avg':0,'wr':0,'sharpe':0,'dd':0,
+                'max_consec_loss':0,'max_consec_win':0,'avg_win':0,'avg_loss':0}
     pnl = np.array([r['pnl'] for r in results])
     n = len(pnl)
     cum = np.cumsum(pnl)
     dd = float((cum - np.maximum.accumulate(cum)).min())
+    wins_arr = pnl > 0
+    # Consecutive streaks
+    max_loss = max_win = cur_loss = cur_win = 0
+    for w in wins_arr:
+        if w:
+            cur_win += 1; cur_loss = 0
+            max_win = max(max_win, cur_win)
+        else:
+            cur_loss += 1; cur_win = 0
+            max_loss = max(max_loss, cur_loss)
+    # Average win/loss size
+    win_pnls = pnl[pnl > 0]
+    loss_pnls = pnl[pnl <= 0]
+    avg_win = float(win_pnls.mean()) if len(win_pnls) > 0 else 0
+    avg_loss = float(loss_pnls.mean()) if len(loss_pnls) > 0 else 0
     return {'n': n, 'pnl': round(float(pnl.sum()),1), 'avg': round(float(pnl.mean()),2),
             'wr': round(int((pnl>0).sum())/n*100,1),
             'sharpe': round(float(pnl.mean()/pnl.std()),3) if pnl.std()>0 else 0,
-            'dd': round(dd,1)}
+            'dd': round(dd,1),
+            'max_consec_loss': max_loss, 'max_consec_win': max_win,
+            'avg_win': round(avg_win, 2), 'avg_loss': round(avg_loss, 2)}
 
 def _daily_map(results):
     by_date = defaultdict(list)
@@ -361,6 +379,8 @@ def print_strat_card(label, results, all_dates, show_coins=None):
     print(f"\n  ┌─ {label}")
     print(f"  │  N={s['n']}  PnL=${s['pnl']:+.1f}  avg=${s['avg']:+.2f}  "
           f"WR={s['wr']:.1f}%  Sharpe={s['sharpe']:+.3f}  DD=${s['dd']:.1f}")
+    print(f"  │  avg_win=${s['avg_win']:+.2f}  avg_loss=${s['avg_loss']:+.2f}  "
+          f"max_consec_loss={s['max_consec_loss']}  max_consec_win={s['max_consec_win']}")
     by_date = _daily_map(results)
     print(f"  │")
     print(f"  │  {'date':>12s}  {'N':>4s}  {'PnL':>9s}  {'avg':>8s}  {'WR':>5s}")
@@ -584,6 +604,133 @@ def main(events_dir, coins_filter=None):
             cs = stats(cr)
             if cs['n'] == 0: continue
             print(f"  {label:>38s}  {cs['n']:>4d}  ${cs['pnl']:>+8.1f}  ${cs['avg']:>+6.2f}  {cs['wr']:>4.1f}%  {cs['sharpe']:>+6.3f}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # Bankroll simulation
+    # ═══════════════════════════════════════════════════════════════
+    print(f"\n{'═'*74}")
+    print(f"  BANKROLL SIMULATION — $100 starting capital, 30-day projection")
+    print(f"{'═'*74}")
+
+    # Get the top strategies with positive Sharpe
+    sim_strats = []
+    for label, kw in strats:
+        r = evaluate(m_res, m_fills, m_sigs, **kw)
+        s = stats(r)
+        if s['n'] >= 15 and s['sharpe'] > 0:
+            sim_strats.append((label, r, s))
+
+    # Also run per-coin BTC for the best strategies
+    if 'btc' in coin_data:
+        r_btc, f_btc, s_btc = coin_data['btc']
+        for label, kw in strats:
+            if 'fi + dist>=+5bps' in label or 'fi + dist>=+3bps' in label or 'dip-buy' in label:
+                cr = evaluate(r_btc, f_btc, s_btc, **kw)
+                cs = stats(cr)
+                if cs['n'] >= 5 and cs['sharpe'] > 0:
+                    sim_strats.append((f"BTC only: {label}", cr, cs))
+
+    n_days_data = len(all_dates)
+    bankroll = 100.0
+
+    sizing_modes = [
+        ("$2 fixed",       lambda br: 2.0),
+        ("$5 fixed",       lambda br: 5.0),
+        ("$10 fixed",      lambda br: 10.0),
+        ("2% of bankroll", lambda br: br * 0.02),
+        ("5% of bankroll", lambda br: br * 0.05),
+        ("10% of bankroll",lambda br: br * 0.10),
+    ]
+
+    for strat_label, trades, s in sim_strats:
+        if s['n'] == 0:
+            continue
+        trades_sorted = sorted(trades, key=lambda t: t['start_us'])
+        trades_per_day = s['n'] / n_days_data
+        projected_trades_30d = int(trades_per_day * 30)
+
+        print(f"\n  ┌─ {strat_label}")
+        print(f"  │  Observed: {s['n']} trades / {n_days_data} days = {trades_per_day:.1f}/day → ~{projected_trades_30d} trades/month")
+        print(f"  │  WR={s['wr']}%  avg_win=${s['avg_win']:+.2f}  avg_loss=${s['avg_loss']:+.2f}  "
+              f"max_consec_loss={s['max_consec_loss']}")
+        print(f"  │")
+        print(f"  │  {'sizing':>18s}  {'final $':>8s}  {'return':>7s}  {'max DD':>8s}  {'bust?':>6s}  {'worst streak $':>14s}")
+        print(f"  │  {'─'*68}")
+
+        # Replay observed trades with each sizing, then extrapolate
+        pnl_sequence = np.array([t['pnl'] for t in trades_sorted])  # at $50 sizing
+
+        for size_label, size_fn in sizing_modes:
+            br = bankroll
+            peak = br
+            max_dd_pct = 0
+            busted = False
+            worst_streak_loss = 0
+            cur_streak_loss = 0
+
+            # Scale factor: trade PnL is at $50, we need to rescale
+            for raw_pnl in pnl_sequence:
+                bet = min(size_fn(br), br)  # can't bet more than bankroll
+                if bet < 0.50:  # minimum viable bet
+                    busted = True
+                    break
+                scale = bet / 50.0
+                actual_pnl = raw_pnl * scale
+                br += actual_pnl
+
+                if br > peak:
+                    peak = br
+                dd_pct = (peak - br) / peak * 100 if peak > 0 else 0
+                max_dd_pct = max(max_dd_pct, dd_pct)
+
+                if raw_pnl <= 0:
+                    cur_streak_loss += bet  # lost the whole bet
+                    worst_streak_loss = max(worst_streak_loss, cur_streak_loss)
+                else:
+                    cur_streak_loss = 0
+
+            # Extrapolate to 30 days: simple scaling from observed period
+            if not busted and n_days_data > 0:
+                observed_return = (br - bankroll) / bankroll
+                monthly_return = observed_return * (30 / n_days_data)
+                final_30d = bankroll * (1 + monthly_return)
+            else:
+                monthly_return = -1
+                final_30d = 0
+
+            bust_str = "YES" if busted or final_30d < 1 else "no"
+            print(f"  │  {size_label:>18s}  ${final_30d:>7.1f}  {monthly_return:>+6.0%}  {max_dd_pct:>6.1f}%  {bust_str:>6s}  ${worst_streak_loss:>13.1f}")
+
+        print(f"  └{'─'*68}")
+
+    # Recommendation
+    print(f"\n  ┌─ RECOMMENDATION")
+    print(f"  │")
+    print(f"  │  ⚠  5 days of data is NOT enough to trade with real money.")
+    print(f"  │  The numbers above are extrapolations — actual results WILL differ.")
+    print(f"  │")
+    print(f"  │  If you must test:")
+    print(f"  │    • Start with $2/trade fixed sizing (max risk = $2 per window)")
+    print(f"  │    • BTC only, C3 (fi+d>=5bps) — most stable signal")
+    print(f"  │    • Run for 2 weeks, track results vs backtest")
+    print(f"  │    • If WR stays >65% after 50+ trades, consider $5/trade")
+    print(f"  │")
+    print(f"  │  Kelly criterion (theoretical optimal sizing):")
+    best_s = max(sim_strats, key=lambda x: x[2]['sharpe']) if sim_strats else None
+    if best_s:
+        bs = best_s[2]
+        wr = bs['wr'] / 100
+        avg_w = bs['avg_win'] / 50  # as multiple of bet
+        avg_l = abs(bs['avg_loss']) / 50
+        if avg_l > 0:
+            kelly = wr / avg_l - (1 - wr) / avg_w if avg_w > 0 else 0
+            half_kelly = kelly / 2
+            print(f"  │    Best strategy: {best_s[0]}")
+            print(f"  │    Full Kelly = {kelly:.1%} of bankroll per trade")
+            print(f"  │    Half Kelly (safer) = {half_kelly:.1%} = ${bankroll * half_kelly:.2f}/trade")
+        else:
+            print(f"  │    (cannot compute — no losses in sample, too few trades)")
+    print(f"  └{'─'*68}")
 
     print(f"\n{'═'*74}")
     print(f"  DONE in {time.time()-t_total:.0f}s")

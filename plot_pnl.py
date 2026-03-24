@@ -66,7 +66,7 @@ def main(events_dir, output_path="pnl_viewer.html"):
     coins = ['btc', 'eth', 'sol']
 
     # Load data
-    all_windows, mdf = load_all_markets(events_dir)
+    all_windows = load_all_markets(events_dir)
     all_tokens = set()
     coin_windows = {}
     for coin in coins:
@@ -106,24 +106,26 @@ def main(events_dir, output_path="pnl_viewer.html"):
         for obs in [15, 30, 45, 60]:
             if obs in s: m_sig[obs].update(s[obs])
 
-    # Define all strategies
+    # Define all strategies (v4 — with real fees)
     fi15 = dict(obs_secs=30, flow_threshold=0.2, use_imbalance=True, interval_filter=15)
     b15 = dict(obs_secs=30, interval_filter=15)
 
     strategy_defs = {
-        # UP strategies
-        'fi15':       ('UP: flow+imb (base)',       '#f5c842', None,   fi15),
-        'flow15':     ('UP: flow only',             '#5a7099', [6,3],  dict(obs_secs=30, flow_threshold=0.2, interval_filter=15)),
-        'fi15_d0':    ('UP: fi + d>=0',             '#22d98e', None,   dict(**fi15, bn_distance_min=0)),
-        'fi15_d3':    ('UP: fi + d>=+3bps',         '#4d94ff', None,   dict(**fi15, bn_distance_min=3)),
-        'fi15_d5':    ('UP: fi + d>=+5bps',         '#a06cff', None,   dict(**fi15, bn_distance_min=5)),
-        # DOWN strategies
-        'dn_d3':      ('DOWN: d<=-3bps',            '#ff6b6b', [4,4],  dict(**b15, force_direction="down", bn_distance_max_signed=-3)),
-        'dn_d5':      ('DOWN: d<=-5bps',            '#ff4070', None,   dict(**b15, force_direction="down", bn_distance_max_signed=-5)),
-        'dn_d7':      ('DOWN: d<=-7bps',            '#cc3360', None,   dict(**b15, force_direction="down", bn_distance_max_signed=-7)),
-        # Losers for reference
-        'fi15_below': ('UP: fi + d<=0 (bad)',       '#664400', [4,4],  dict(**fi15, bn_distance_max_signed=0)),
-        'flow5':      ('5m flow (bad)',             '#663333', [3,3],  dict(obs_secs=30, flow_threshold=0.2, interval_filter=5)),
+        # Benchmarks
+        'bench_up':   ('Benchmark: always UP',          '#333333', [6,3],  dict(**b15, force_direction="up")),
+        'fi15':       ('flow+imb (base)',                '#5a7099', [4,4],  fi15),
+        # Top by Sharpe
+        'C5':         ('fi + dist>=+10bps',              '#f5c842', None,   dict(**fi15, bn_distance_min=10)),
+        'C3':         ('fi + dist>=+5bps',               '#a06cff', None,   dict(**fi15, bn_distance_min=5)),
+        'C2':         ('fi + dist>=+3bps',               '#4d94ff', None,   dict(**fi15, bn_distance_min=3)),
+        # Top by PnL
+        'F3':         ('dip-buy (d<=0 + ret<0)',         '#22d98e', None,   dict(**fi15, bn_distance_max_signed=0, bn_momentum_range=(-9999, 0))),
+        'D1':         ('mean-rev (fi + dist<=0)',        '#00ccff', None,   dict(**fi15, bn_distance_max_signed=0)),
+        # Timing
+        'H3':         ('fi+d>=5 obs=45s',                '#ff9f43', None,   dict(obs_secs=45, flow_threshold=0.2, use_imbalance=True, interval_filter=15, bn_distance_min=5)),
+        # Other interesting
+        'D3':         ('fi + dist<=-5bps',               '#ff6b6b', None,   dict(**fi15, bn_distance_max_signed=-5)),
+        'C4':         ('fi + dist>=+7bps',               '#e84393', None,   dict(**fi15, bn_distance_min=7)),
     }
 
     # Evaluate all
@@ -135,6 +137,14 @@ def main(events_dir, output_path="pnl_viewer.html"):
         r, f, s = coin_data[coin]
         strat_results[f'coin_{coin}'] = evaluate(r, f, s, **fi15)
 
+    # BTC-only strategies (the real winners)
+    if 'btc' in coin_data:
+        r_btc, f_btc, s_btc = coin_data['btc']
+        strat_results['btc_C2'] = evaluate(r_btc, f_btc, s_btc, **dict(**fi15, bn_distance_min=3))
+        strat_results['btc_C3'] = evaluate(r_btc, f_btc, s_btc, **dict(**fi15, bn_distance_min=5))
+        strat_results['btc_C5'] = evaluate(r_btc, f_btc, s_btc, **dict(**fi15, bn_distance_min=10))
+        strat_results['btc_F3'] = evaluate(r_btc, f_btc, s_btc, **dict(**fi15, bn_distance_max_signed=0, bn_momentum_range=(-9999, 0)))
+
     # Combined strategies (merge trade lists)
     def combined(up_key, dn_key, label, color):
         trades = sorted(strat_results.get(up_key, []) + strat_results.get(dn_key, []),
@@ -142,9 +152,8 @@ def main(events_dir, output_path="pnl_viewer.html"):
         return label, color, None, trades
 
     combined_defs = {
-        'mix_safe':  combined('fi15_d0', 'dn_d5', 'MIX: UP(fi+d>=0) + DN(d<=-5)', '#00ffaa'),
-        'mix_tight': combined('fi15_d3', 'dn_d5', 'MIX: UP(fi+d>=3) + DN(d<=-5)', '#00ccff'),
-        'mix_aggro': combined('fi15',    'dn_d3', 'MIX: UP(fi) + DN(d<=-3)',       '#ffaa00'),
+        'mix_momentum': combined('C3', 'F3', 'MIX: dist>=+3 + dip-buy', '#00ffaa'),
+        'mix_extreme':  combined('C5', 'D3', 'MIX: dist>=+10 + dist<=-5', '#ff00ff'),
     }
 
     # Build JSON
@@ -164,6 +173,18 @@ def main(events_dir, output_path="pnl_viewer.html"):
     colors = {k: v[1] for k, v in strategy_defs.items()}
     colors.update({k: v[1] for k, v in combined_defs.items()})
     colors.update({'coin_btc': '#f7931a', 'coin_eth': '#6b8ef0', 'coin_sol': '#a855f7'})
+    # BTC-only
+    btc_strats = {
+        'btc_C2': ('BTC C2 fi+d>=3bps', '#ff8c00'),
+        'btc_C3': ('BTC C3 fi+d>=5bps', '#ff4500'),
+        'btc_C5': ('BTC C5 fi+d>=10bps', '#dc143c'),
+        'btc_F3': ('BTC F3 dip-buy', '#32cd32'),
+    }
+    for k, (label, color) in btc_strats.items():
+        if k in strat_results:
+            series[k] = build_series(strat_results[k], label)
+            summary[k] = make_stats(strat_results[k])
+            colors[k] = color
     dashes = {k: v[2] for k, v in strategy_defs.items()}
 
     json_data = json.dumps({
@@ -236,8 +257,8 @@ tr:hover td { background: var(--s2); }
   <div class="pill-group" id="view-pills">
     <div class="pill active" data-val="main">MAIN</div>
     <div class="pill" data-val="mixed">MIXED</div>
-    <div class="pill" data-val="up">UP ONLY</div>
-    <div class="pill" data-val="down">DOWN ONLY</div>
+    <div class="pill" data-val="up">UP STRATEGIES</div>
+    <div class="pill" data-val="btc_only">BTC ONLY</div>
     <div class="pill" data-val="per_coin">PER COIN</div>
     <div class="pill" data-val="all">ALL</div>
   </div>
@@ -254,12 +275,13 @@ tr:hover td { background: var(--s2); }
 <script>
 const RAW = __DATA_PLACEHOLDER__;
 const VIEWS = {
-  main:     ['fi15', 'fi15_d0', 'dn_d5', 'mix_safe'],
-  mixed:    ['mix_safe', 'mix_tight', 'mix_aggro', 'fi15'],
-  up:       ['fi15', 'fi15_d0', 'fi15_d3', 'fi15_d5'],
-  down:     ['dn_d3', 'dn_d5', 'dn_d7'],
+  main:     ['C3', 'C5', 'F3', 'D1', 'fi15', 'bench_up'],
+  mixed:    ['mix_momentum', 'mix_extreme', 'C3', 'F3'],
+  up:       ['C2', 'C3', 'C4', 'C5', 'D1', 'D3'],
+  down:     ['fi15', 'bench_up'],
   per_coin: ['coin_btc', 'coin_eth', 'coin_sol'],
-  all:      ['fi15', 'fi15_d0', 'fi15_d3', 'dn_d5', 'dn_d7', 'mix_safe', 'mix_tight'],
+  btc_only: ['btc_C2', 'btc_C3', 'btc_C5', 'btc_F3'],
+  all:      ['C2', 'C3', 'C5', 'F3', 'D1', 'D3', 'H3', 'fi15', 'bench_up', 'btc_C2', 'btc_C3', 'btc_C5', 'btc_F3', 'coin_btc', 'coin_eth', 'coin_sol', 'mix_momentum', 'mix_extreme'],
 };
 let currentView = 'main', sizeMultiplier = 1, chart = null;
 

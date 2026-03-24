@@ -86,7 +86,7 @@ class PolymarketBookWS:
         self._down_book_ts: Optional[datetime] = None
 
         # ── Trade state ───────────────────────────────────────────────────────
-        self.trade_events: deque[tuple[datetime, float, str, str]] = deque(
+        self.trade_events: deque[tuple[datetime, float, str, str, float]] = deque(
             maxlen=POLY_TRADE_DEQUE_MAXLEN
         )
         self.last_trade_dt: Optional[datetime] = None
@@ -180,7 +180,7 @@ class PolymarketBookWS:
                     ts = from_unix_ts(event.get("timestamp")) or now
                     tx = normalize_text(event.get("transaction_hash") or
                                         f"pc_{ts.timestamp():.6f}_{chg_size}")
-                    self.trade_events.append((ts, chg_size, tx, asset_id or ""))
+                    self.trade_events.append((ts, chg_size, tx, asset_id or "", 0.0))
                     self.last_trade_dt = ts
                     self._clear_old_trades(now)
 
@@ -205,9 +205,10 @@ class PolymarketBookWS:
         asset_id = normalize_text(event.get("asset_id") or "")
         trade_dt = from_unix_ts(event.get("timestamp")) or now
         size     = safe_float(event.get("size")) or 0.0
+        price    = safe_float(event.get("price")) or 0.0
         tx_hash  = normalize_text(event.get("transaction_hash") or "")
         with self._lock:
-            self.trade_events.append((trade_dt, size, tx_hash, asset_id))
+            self.trade_events.append((trade_dt, size, tx_hash, asset_id, price))
             if asset_id == self.current_asset_id:
                 self.last_trade_dt = trade_dt
             self._clear_old_trades(now)
@@ -462,7 +463,7 @@ class PolymarketBookWS:
             s10 = s60 = 0.0
             current_asset = self.current_asset_id
 
-            for trade_dt, size, tx_hash, asset_id in self.trade_events:
+            for trade_dt, size, tx_hash, asset_id, _price in self.trade_events:
                 if current_asset and asset_id and asset_id != current_asset:
                     continue
                 if trade_dt >= cutoff_60:
