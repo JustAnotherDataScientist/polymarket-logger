@@ -528,6 +528,7 @@ def run_logger(dashboard: Any = None, event_store: Any = None) -> None:
     next_tick_mono = time.monotonic()
     next_log_mono  = time.monotonic()
     next_storage_report_mono = time.monotonic() + 3600 * 6
+    _next_mem_diag_mono = time.monotonic() + 60  # first diag after 1 min
 
     # ── Shutdown ───────────────────────────────────────────────────────────
     shutdown_flag = threading.Event()
@@ -582,6 +583,38 @@ def run_logger(dashboard: Any = None, event_store: Any = None) -> None:
                     if report:
                         logger.info("Storage: %s", report)
                     next_storage_report_mono = now_mono + 3600 * 6
+
+                # ── Memory diagnostics (every 10 min) ─────────────────────
+                if now_mono >= _next_mem_diag_mono:
+                    import os as _os
+                    try:
+                        _rss_kb = 0
+                        with open(f"/proc/{_os.getpid()}/status") as _f:
+                            for _line in _f:
+                                if _line.startswith("VmRSS:"):
+                                    _rss_kb = int(_line.split()[1])
+                                    break
+                        _rss_mb = _rss_kb // 1024
+                    except Exception:
+                        _rss_mb = -1
+                    _bn_diag = {}
+                    with multi_ws.lock:
+                        for _asset, _st in multi_ws.state.items():
+                            _bn_diag[_asset] = {
+                                "buckets": len(_st["second_buckets"]),
+                                "trade_ids": len(_st["recent_trade_ids"]),
+                                "trade_id_set": len(_st["recent_trade_id_set"]),
+                            }
+                    _poly_diag = {}
+                    for _tr in trackers:
+                        with _tr.poly_ws._lock:
+                            _poly_diag[_tr.key] = len(_tr.poly_ws.trade_events)
+                    _n_threads = threading.active_count()
+                    logger.info(
+                        "MEMDIAG rss=%dMB threads=%d bn=%s poly_trades=%s",
+                        _rss_mb, _n_threads, _bn_diag, _poly_diag,
+                    )
+                    _next_mem_diag_mono = now_mono + 600  # every 10 min
 
                 snap_dt = utc_now()
 
