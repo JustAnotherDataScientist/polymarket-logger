@@ -182,6 +182,11 @@ class PaperTrader:
                 asset_id = item[3]
                 price = item[4] if len(item) > 4 else 0.0
 
+                # Skip price_change events that have no real trade price
+                # (only last_trade_price events carry an actual price > 0)
+                if price <= 0:
+                    continue
+
                 if trade_dt < cutoff:
                     continue
 
@@ -195,8 +200,20 @@ class PaperTrader:
                 else:
                     sell_vol += size
 
+            # Count skipped events for diagnostics
+            n_skipped_price0 = sum(
+                1 for item in poly_ws.trade_events
+                if item[0] >= cutoff and (item[4] if len(item) > 4 else 0.0) <= 0
+            )
+
             total = buy_vol + sell_vol
             flow = (buy_vol - sell_vol) / total if total > 0 else 0.0
+            logger.info(
+                "PAPER[%s] flow_diag: mid=%.4f | deque=%d | real_trades=%d "
+                "skipped_p0=%d | buy=%.1f sell=%.1f → flow=%+.3f",
+                STRATEGY_NAME, mid, len(poly_ws.trade_events), n,
+                n_skipped_price0, buy_vol, sell_vol, flow,
+            )
             return flow, n
 
     def _make_decision(self, snap: dict, poly_ws: Any, now_dt: datetime) -> None:
