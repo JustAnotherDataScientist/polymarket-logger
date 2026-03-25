@@ -158,9 +158,10 @@ class PaperTrader:
         Compute poly flow from trade_events over the last 30s.
         Returns (flow_ratio, n_trades).
         Flow = (buy_volume - sell_volume) / total_volume.
-        Buy if trade price >= mid, sell otherwise.
+        Buy if trade price >= mid_at_trade_time (matches backtest logic).
         """
         with poly_ws._lock:
+            # Current mid — used only to check if book is alive
             mid = None
             if poly_ws._bids and poly_ws._asks:
                 best_bid = poly_ws._bids[0][0] if poly_ws._bids else 0
@@ -181,6 +182,7 @@ class PaperTrader:
                 size = item[1]
                 asset_id = item[3]
                 price = item[4] if len(item) > 4 else 0.0
+                trade_mid = item[5] if len(item) > 5 else 0.0
 
                 # Skip price_change events that have no real trade price
                 # (only last_trade_price events carry an actual price > 0)
@@ -194,8 +196,11 @@ class PaperTrader:
                 if poly_ws.current_asset_id and asset_id and asset_id != poly_ws.current_asset_id:
                     continue
 
+                # Use mid at the time of the trade (not current mid)
+                # This matches backtest which classifies each trade vs its contemporaneous mid
+                ref_mid = trade_mid if trade_mid > 0 else mid
                 n += 1
-                if price >= mid:
+                if price >= ref_mid:
                     buy_vol += size
                 else:
                     sell_vol += size
@@ -209,7 +214,7 @@ class PaperTrader:
             total = buy_vol + sell_vol
             flow = (buy_vol - sell_vol) / total if total > 0 else 0.0
             logger.info(
-                "PAPER[%s] flow_diag: mid=%.4f | deque=%d | real_trades=%d "
+                "PAPER[%s] flow_diag: mid_now=%.4f | deque=%d | real_trades=%d "
                 "skipped_p0=%d | buy=%.1f sell=%.1f → flow=%+.3f",
                 STRATEGY_NAME, mid, len(poly_ws.trade_events), n,
                 n_skipped_price0, buy_vol, sell_vol, flow,
