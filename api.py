@@ -158,6 +158,14 @@ class ApiClient:
                 best_start = window_start
         return best
 
+    def find_next_market(self, coin: str, interval_min: int,
+                         current_window_end: datetime) -> Optional[dict[str, Any]]:
+        """Pre-fetch the next market starting at current_window_end.
+        Slug is deterministic: coin-updown-Xm-{unix_ts}."""
+        ts = int(current_window_end.timestamp())
+        slug = f"{coin}-updown-{interval_min}m-{ts}"
+        return self.get_market_by_slug(slug)
+
     # Keep legacy method for backward compatibility
     def find_latest_btc_5m_market(self, now_dt: datetime) -> Optional[dict[str, Any]]:
         return self.find_active_market("btc", 5, now_dt)

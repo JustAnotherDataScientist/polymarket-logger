@@ -150,14 +150,21 @@ class _MarketFetchResult:
 
 
 class BackgroundMarketFetcher:
-    """Fetches one Polymarket updown market (coin+interval) in background."""
+    """Fetches one Polymarket updown market (coin+interval) in background.
+    
+    Supports prefetch: call request_prefetch(window_end_dt) to pre-fetch
+    the next market before the current window ends.
+    """
     def __init__(self, client: ApiClient, coin: str, interval_min: int) -> None:
         self._client       = client
         self._coin         = coin
         self._interval_min = interval_min
         self._result_q: queue.Queue[_MarketFetchResult] = queue.Queue(maxsize=1)
+        self._prefetch_q: queue.Queue[_MarketFetchResult] = queue.Queue(maxsize=1)
         self._req_event  = threading.Event()
         self._stop_event = threading.Event()
+        self._prefetch_end_dt: Optional[datetime] = None
+        self._prefetch_done = False
         name = f"mkt-{coin}-{interval_min}m"
         self._thread = threading.Thread(target=self._loop, daemon=True, name=name)
 
@@ -165,8 +172,17 @@ class BackgroundMarketFetcher:
     def stop(self) -> None:    self._stop_event.set(); self._req_event.set()
     def request_fetch(self) -> None: self._req_event.set()
 
+    def request_prefetch(self, window_end_dt: datetime) -> None:
+        self._prefetch_end_dt = window_end_dt
+        self._prefetch_done = False
+        self._req_event.set()
+
     def pop_result(self) -> Optional[_MarketFetchResult]:
         try:    return self._result_q.get_nowait()
+        except queue.Empty: return None
+
+    def pop_prefetch(self) -> Optional[_MarketFetchResult]:
+        try:    return self._prefetch_q.get_nowait()
         except queue.Empty: return None
 
     def _loop(self) -> None:
@@ -174,6 +190,8 @@ class BackgroundMarketFetcher:
             self._req_event.wait(timeout=1.5)
             self._req_event.clear()
             if self._stop_event.is_set(): break
+
+            # Normal fetch
             try:
                 now_dt = utc_now()
                 market = self._client.find_active_market(self._coin, self._interval_min, now_dt)
@@ -191,6 +209,27 @@ class BackgroundMarketFetcher:
             except queue.Empty: pass
             try:    self._result_q.put_nowait(result)
             except queue.Full: pass
+
+            # Prefetch next market (if requested)
+            pf_dt = self._prefetch_end_dt
+            if pf_dt is not None and not self._prefetch_done:
+                try:
+                    nm = self._client.find_next_market(self._coin, self._interval_min, pf_dt)
+                    if nm is not None:
+                        slug = normalize_text(nm.get("slug"))
+                        ws, we = market_window_from_slug(slug)
+                        pf_result = _MarketFetchResult(nm, ws, we)
+                        logger.info("Prefetched [%s-%dm]: %s", self._coin, self._interval_min, slug)
+                    else:
+                        pf_result = _MarketFetchResult(None, None, None)
+                except Exception as exc:
+                    logger.debug("Prefetch[%s-%dm]: %s", self._coin, self._interval_min, exc)
+                    pf_result = _MarketFetchResult(None, None, None)
+                try:    self._prefetch_q.get_nowait()
+                except queue.Empty: pass
+                try:    self._prefetch_q.put_nowait(pf_result)
+                except queue.Full: pass
+                self._prefetch_done = True
 
 
 class BackgroundBookFetcher:
@@ -310,6 +349,14 @@ class MarketTracker:
         self.last_window_end: Optional[datetime] = None
         self.target_cache:    dict[str, Optional[float]] = {}
 
+        # Prefetch: pre-start WS on next market's tokens before window switch
+        self._client = client
+        self._prefetched_market: Optional[_MarketFetchResult] = None
+        self._next_poly_ws: Optional[PolymarketBookWS] = None
+        self._next_up_token: Optional[str] = None
+        self._next_down_token: Optional[str] = None
+        self._prefetch_requested = False
+
         self._next_refresh_mono = 0.0
 
     def start(self) -> None:
@@ -319,6 +366,8 @@ class MarketTracker:
     def stop(self) -> None:
         self.fetcher.stop()
         self.poly_ws.stop()
+        if self._next_poly_ws is not None:
+            self._next_poly_ws.stop()
 
     def tick(self, now_dt: datetime, now_mono: float,
              client: ApiClient, snap_dt: datetime) -> dict:
@@ -326,6 +375,37 @@ class MarketTracker:
         Call every poll tick. Returns a dict with all market-specific signals.
         Never blocks — all network calls are in background threads.
         """
+        # ── Prefetch next market ~30s before window end ───────────────────
+        if (self.cached_window_end and not self._prefetch_requested):
+            remaining = (self.cached_window_end - now_dt).total_seconds()
+            if 0 < remaining < 35:
+                self.fetcher.request_prefetch(self.cached_window_end)
+                self._prefetch_requested = True
+
+        # Consume prefetch result → pre-start WS on next tokens
+        pf_result = self.fetcher.pop_prefetch()
+        if pf_result is not None and pf_result.market is not None:
+            self._prefetched_market = pf_result
+            # Extract tokens and pre-start a WS
+            pf_up = client.get_up_token_id(pf_result.market) or ""
+            pf_down = client.get_down_token_id(pf_result.market) or ""
+            if pf_up and pf_up != self.last_up_token:
+                # Start a new WS on the next tokens — runs in parallel
+                ws = PolymarketBookWS()
+                # Attach event recorder if event store is configured
+                if self._event_store is not None:
+                    try:
+                        from event_recording import attach_poly_recorder
+                        attach_poly_recorder(ws, self._event_store)
+                    except Exception as e:
+                        logger.debug("Prefetch recorder attach error: %s", e)
+                ws.start(pf_up, down_asset_id=pf_down or None)
+                self._next_poly_ws = ws
+                self._next_up_token = pf_up
+                self._next_down_token = pf_down
+                logger.info("Pre-started WS [%s] on next tokens (%.0fs before switch)",
+                            self.key, (self.cached_window_end - now_dt).total_seconds())
+
         # ── Refresh market ────────────────────────────────────────────────
         should_fetch = (
             self.cached_market is None
@@ -333,7 +413,16 @@ class MarketTracker:
             or now_mono >= self._next_refresh_mono
         )
         if should_fetch:
-            self.fetcher.request_fetch()
+            # Use prefetched market if available — zero-latency switch
+            if self._prefetched_market is not None and self._prefetched_market.market is not None:
+                pf = self._prefetched_market
+                self.cached_market       = pf.market
+                self.cached_window_start = pf.window_start
+                self.cached_window_end   = pf.window_end
+                self._prefetched_market  = None
+                logger.info("Using prefetched market [%s] — zero-latency switch", self.key)
+            else:
+                self.fetcher.request_fetch()
             self._next_refresh_mono = now_mono + MARKET_REFRESH_SECONDS
 
         fr = self.fetcher.pop_result()
@@ -395,14 +484,37 @@ class MarketTracker:
                 self.last_slug       = market_slug
                 self.last_window_end = self.cached_window_end
                 self.mid_tracker.reset()
+                self._prefetch_requested = False
+                self._prefetched_market  = None
 
             down_token_id = client.get_down_token_id(self.cached_market) or ""
 
             if up_token_id != self.last_up_token or down_token_id != self.last_down_token:
                 if up_token_id:
-                    self.poly_ws.start(up_token_id, down_asset_id=down_token_id or None)
+                    # Try zero-latency swap with pre-started WS
+                    if (self._next_poly_ws is not None
+                            and self._next_up_token == up_token_id):
+                        old_ws = self.poly_ws
+                        self.poly_ws = self._next_poly_ws
+                        self._next_poly_ws = None
+                        self._next_up_token = None
+                        self._next_down_token = None
+                        old_ws.stop()
+                        logger.info("Zero-latency WS swap [%s] — already connected %.1fs",
+                                    self.key,
+                                    (snap_dt - (self.poly_ws._book_ts or snap_dt)).total_seconds()
+                                    if self.poly_ws._book_ts else 0)
+                    else:
+                        # Fallback: normal start (3-5s latency)
+                        self.poly_ws.start(up_token_id, down_asset_id=down_token_id or None)
+                        if self._next_poly_ws is not None:
+                            self._next_poly_ws.stop()
+                            self._next_poly_ws = None
                 else:
                     self.poly_ws.stop()
+                    if self._next_poly_ws is not None:
+                        self._next_poly_ws.stop()
+                        self._next_poly_ws = None
                 self.cached_book = {}
                 self.last_up_token   = up_token_id
                 self.last_down_token = down_token_id
